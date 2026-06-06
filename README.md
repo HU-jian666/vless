@@ -5,7 +5,7 @@
 ## 一键安装 / Quick Start
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/HU-jian666/vless/main/install.sh)
 ```
 
 ## 带参数运行 / With Parameters
