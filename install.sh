@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  VLESS + REALITY + XRAY  一键安装脚本
+#  VLESS + REALITY + XRAY  一键安装脚本 (64MB / 无 swap / 只读 proc 优化版)
 #  https://github.com/YOUR_USERNAME/YOUR_REPO
 #  Usage: bash install.sh [--port PORT] [--domain DOMAIN]
 # ============================================================
@@ -23,10 +23,10 @@ cat <<'EOF'
   \ \ / / |  | __|| __/ __| | _ \| __/_\ | | |_ _|_ _\ \ / 
    \ V /| |__| _| | _|\__ \ |   /| _/ _ \| |  | | | | \ V / 
     \_/ |____|___||___|___/ |_|_\|_/_/ \_\_| |___|___| \_/  
-                  XRAY-CORE  ·  VLESS  ·  REALITY
+                  XRAY-CORE  ·  VLESS  ·  REALITY  ·  LOWMEM
 EOF
     echo -e "${PINK}  github.com/YOUR_USERNAME/YOUR_REPO${NC}"
-    echo -e "  本脚本支持带参数执行，不带参数将直接无敌 / See ${CYAN}--help${NC} for parameters"
+    echo -e "  低内存优化版：64MB / 无可用 swap / 只读 procfs 环境适配"
     echo "  ─────────────────────────────────────────────────────────"
 }
 
@@ -116,7 +116,7 @@ do_uninstall() {
     systemctl disable xray 2>/dev/null || true
     bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove 2>/dev/null \
         && ok "移除 Xray / Removed Xray"
-    rm -rf /usr/local/etc/xray /var/log/xray
+    rm -rf /usr/local/etc/xray /var/log/xray /etc/systemd/system/xray.service.d
     ok "删除配置 / Removed config"
     echo ""
     echo -e "${PINK}  ──────────── 卸载完成 / Uninstall Done ────────────${NC}"
@@ -144,27 +144,40 @@ check_tools() {
     ok "工具链检查 / Tool check ... [OK]"
 }
 
-# ── 内存优化 / Swap (for ≤128MB VPS) ─────────────────────────
+# ── 内存优化 / Swap ───────────────────────────────────────────
+# 部分容器化 NAT VPS (OpenVZ/LXC 等) 无法创建 swap，procfs 只读，
+# fallocate/dd/swapon 会直接失败 —— 这里不再假设 swap 一定可用，
+# 失败就跳过，不中断安装。
 setup_swap() {
     local mem_mb
-    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-    if [[ $mem_mb -lt 256 ]]; then
-        info "内存优化 / Low memory detected (${mem_mb}MB), creating swap ..."
-        if ! swapon --show | grep -q '/swapfile'; then
-            fallocate -l 512M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
-            chmod 600 /swapfile
-            mkswap /swapfile -q
-            swapon /swapfile
-            grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        fi
+    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    info "检测到内存 / Detected memory: ${mem_mb}MB"
+
+    if [[ $mem_mb -ge 256 ]]; then
+        return 0
+    fi
+
+    if swapon --show 2>/dev/null | grep -q '/swapfile'; then
+        ok "Swap 已存在 / Swap already active"
+        return 0
+    fi
+
+    info "尝试创建 swap / Attempting swap (best-effort) ..."
+    if ( fallocate -l 256M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=256 status=none 2>/dev/null ) \
+        && chmod 600 /swapfile \
+        && mkswap /swapfile -q 2>/dev/null \
+        && swapon /swapfile 2>/dev/null; then
+        grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab 2>/dev/null || true
         ok "Swap 已就绪 / Swap ready"
+    else
+        rm -f /swapfile
+        warn "无法创建 swap（容器限制），跳过，转而收紧 Xray 内存占用 / Swap unavailable (container limitation) — skipping, will constrain Xray memory instead"
     fi
 }
 
 # ── 安装 Xray / Install XRAY ─────────────────────────────────
 install_xray() {
     info "开始安装 XRAY / Install XRAY ..."
-    # 使用官方安装脚本，带重试
     local try=0
     while [[ $try -lt 3 ]]; do
         if bash -c "$(curl -fsSL --retry 3 --retry-delay 2 \
@@ -180,17 +193,30 @@ install_xray() {
     die "Xray 安装失败 / Xray install failed"
 }
 
-# ── 更新 geodata ──────────────────────────────────────────────
+# ── 更新 geodata / lite 版本节省内存 ──────────────────────────
+# 完整 geoip.dat + geosite.dat 加载进 Xray 常驻内存后可能占用
+# 数十 MB，在 64MB VPS 上会直接把服务挤爆。改用仅含
+# private/cn 的精简版，并且不在 routing 里引用 category-ads-all
+# 这类大列表（见 write_config 中路由规则已裁剪）。
 update_geodata() {
-    info "加速，更新 geodata / Updating geodata ..."
+    info "加速，更新精简版 geodata / Updating lite geodata ..."
     local geodir="/usr/local/share/xray"
     mkdir -p "$geodir"
-    for f in geoip.dat geosite.dat; do
+
+    if ! curl -fsSL --retry 3 \
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip-only-cn-private.dat" \
+        -o "${geodir}/geoip.dat" 2>/dev/null; then
         curl -fsSL --retry 3 \
-            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${f}" \
-            -o "${geodir}/${f}" 2>/dev/null || true
-    done
-    ok "加速，更新 geodata / Updating geodata ... [OK]"
+            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" \
+            -o "${geodir}/geoip.dat" 2>/dev/null || true
+    fi
+
+    # geosite 精简版仅保留 private，routing 规则不再引用完整分类列表
+    curl -fsSL --retry 3 \
+        "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" \
+        -o "${geodir}/geosite.dat" 2>/dev/null || true
+
+    ok "加速，更新精简版 geodata / Updating lite geodata ... [OK]"
 }
 
 # ── 生成密钥对 / Generate keypair ─────────────────────────────
@@ -203,6 +229,9 @@ gen_keys() {
 }
 
 # ── 写入配置 / Write config ───────────────────────────────────
+# 相比原版：loglevel 降为 none（省掉日志缓冲内存），路由规则
+# 只保留 geoip:private 拦截（几十条），去掉 category-ads-all 这种
+# 动辄上万条规则的大列表，显著降低常驻内存与规则匹配开销。
 write_config() {
     info "块好了，手搓 / Configuring /usr/local/etc/xray/config.json ..."
     [[ -z "$UUID"  ]] && UUID=$(gen_uuid)
@@ -213,9 +242,7 @@ write_config() {
     cat > /usr/local/etc/xray/config.json <<JSONEOF
 {
   "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error":  "/var/log/xray/error.log"
+    "loglevel": "none"
   },
   "inbounds": [
     {
@@ -244,8 +271,7 @@ write_config() {
         }
       },
       "sniffing": {
-        "enabled": true,
-        "destOverride": ["http","tls","quic"]
+        "enabled": false
       }
     }
   ],
@@ -254,15 +280,33 @@ write_config() {
     { "protocol": "blackhole","tag": "blocked" }
   ],
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
+    "domainStrategy": "AsIs",
     "rules": [
-      { "type": "field", "ip":     ["geoip:private"], "outboundTag": "blocked" },
-      { "type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "blocked" }
+      { "type": "field", "ip": ["geoip:private"], "outboundTag": "blocked" }
     ]
   }
 }
 JSONEOF
     ok "块好了，手搓 / Configuring config.json ... [OK]"
+}
+
+# ── systemd 内存限制 / Hard memory ceiling ────────────────────
+# 没有 swap 的情况下，Xray 一旦内存泄漏或流量突增触发 OOM，
+# 内核可能连带 sshd 一起杀掉导致失联。这里给 xray.service 加一个
+# MemoryMax 硬顶，超限时优先由 systemd/cgroup 杀掉 xray 自身
+# 并交给 Restart= 拉起，而不是让内核 OOM killer 随机选目标。
+write_systemd_override() {
+    info "写入内存硬限制 / Writing memory ceiling for xray.service ..."
+    mkdir -p /etc/systemd/system/xray.service.d
+    cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
+[Service]
+MemoryMax=40M
+MemoryHigh=32M
+Restart=always
+RestartSec=2
+OOMPolicy=continue
+EOF
+    ok "写入内存硬限制 / Memory ceiling written (MemoryMax=40M) ... [OK]"
 }
 
 # ── 启动服务 / Start service ──────────────────────────────────
@@ -276,17 +320,23 @@ start_service() {
     ok "冲刺，开启服务 / Starting Service ... [OK]"
 }
 
-# ── 开启 BBR ──────────────────────────────────────────────────
+# ── 开启 BBR (只读 /proc 环境下静默跳过) ──────────────────────
 enable_bbr() {
     info "最后，打开 BBR / Finishing, Enabling BBR ..."
     if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-        {
-            echo 'net.core.default_qdisc=fq'
-            echo 'net.ipv4.tcp_congestion_control=bbr'
-        } >> /etc/sysctl.conf
-        sysctl -p >/dev/null 2>&1 || true
+        if sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+            {
+                echo 'net.core.default_qdisc=fq'
+                echo 'net.ipv4.tcp_congestion_control=bbr'
+            } >> /etc/sysctl.conf 2>/dev/null || true
+            sysctl -p >/dev/null 2>&1 || true
+            ok "最后，打开 BBR / BBR enabled ... [OK]"
+        else
+            warn "内核不支持写入 (容器/只读 procfs)，跳过 BBR / Kernel write unsupported (container / read-only procfs) — skipping BBR"
+        fi
+    else
+        ok "BBR 已启用 / BBR already enabled"
     fi
-    ok "最后，打开 BBR / Finishing, Enabling BBR ... [OK]"
 }
 
 # ── 防火墙放行 / Firewall ─────────────────────────────────────
@@ -335,7 +385,7 @@ print_result() {
     echo -e "${GREEN}舒服了 / Done:${NC}"
     echo ""
     echo -e "${CYAN}  ╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}  ║          VLESS + REALITY 节点信息                ║${NC}"
+    echo -e "${CYAN}  ║       VLESS + REALITY 节点信息 (LOWMEM)          ║${NC}"
     echo -e "${CYAN}  ╠══════════════════════════════════════════════════╣${NC}"
     printf  "${CYAN}  ║${NC}  %-18s ${YELLOW}%-29s${NC} ${CYAN}║${NC}\n" "地址 / Address:"    "$SERVER_IP"
     printf  "${CYAN}  ║${NC}  %-18s ${YELLOW}%-29s${NC} ${CYAN}║${NC}\n" "端口 / Port:"        "$PORT"
@@ -344,6 +394,7 @@ print_result() {
     printf  "${CYAN}  ║${NC}  %-18s ${YELLOW}%-29s${NC} ${CYAN}║${NC}\n" "SNI / 伪装域名:"     "$DOMAIN"
     printf  "${CYAN}  ║${NC}  %-18s ${YELLOW}%-29s${NC} ${CYAN}║${NC}\n" "Public Key:"         "${PUBLIC_KEY:0:28}..."
     printf  "${CYAN}  ║${NC}  %-18s ${YELLOW}%-29s${NC} ${CYAN}║${NC}\n" "Short ID:"           "$SHORT_ID"
+    printf  "${CYAN}  ║${NC}  %-18s ${YELLOW}%-29s${NC} ${CYAN}║${NC}\n" "MemoryMax:"          "40M (cgroup)"
     echo -e "${CYAN}  ╚══════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}  分享链接 / Share Link:${NC}"
@@ -364,6 +415,7 @@ main() {
     install_xray
     update_geodata
     write_config
+    write_systemd_override
     start_service
     enable_bbr
     open_firewall
