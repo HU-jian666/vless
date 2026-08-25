@@ -70,14 +70,25 @@ ok
 
 # ---------- 内存不足时创建 swap / Create swap on low-RAM systems ----------
 TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
-if [[ $NO_SWAP -eq 0 && $TOTAL_MEM_MB -lt 512 && ! -f /swapfile ]]; then
+IS_CONTAINER=0
+[[ -f /.dockerenv ]] && IS_CONTAINER=1
+grep -qaE '(lxc|docker|container)' /proc/1/cgroup 2>/dev/null && IS_CONTAINER=1
+[[ "$(systemd-detect-virt 2>/dev/null)" =~ ^(lxc|docker|openvz)$ ]] && IS_CONTAINER=1
+
+if [[ $NO_SWAP -eq 0 && $TOTAL_MEM_MB -lt 512 && ! -f /swapfile && $IS_CONTAINER -eq 0 ]]; then
   step "低内存，创建 ${SWAP_MB}MB swap / low RAM, creating ${SWAP_MB}MB swap"
   fallocate -l ${SWAP_MB}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_MB status=none
   chmod 600 /swapfile
   mkswap /swapfile >/dev/null
-  swapon /swapfile
-  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  ok
+  if swapon /swapfile 2>/dev/null; then
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    ok
+  else
+    rm -f /swapfile
+    echo -e "${C_Y}[SKIP]${C_N} 宿主机禁止swap（容器环境） / host disallows swap (container), skipping"
+  fi
+elif [[ $NO_SWAP -eq 0 && $TOTAL_MEM_MB -lt 512 && ! -f /swapfile && $IS_CONTAINER -eq 1 ]]; then
+  echo -e "${C_Y}[SKIP]${C_N} 检测到容器环境，跳过swap创建 / container detected, skipping swap"
 fi
 
 # ---------- 安装 XRAY / Install XRAY (无GeoIP精简版 / no-geoip slim) ----------
