@@ -91,22 +91,33 @@ elif [[ $NO_SWAP -eq 0 && $TOTAL_MEM_MB -lt 512 && ! -f /swapfile && $IS_CONTAIN
   echo -e "${C_Y}[SKIP]${C_N} 检测到容器环境，跳过swap创建 / container detected, skipping swap"
 fi
 
+# ---------- 错误捕获 / Error trap ----------
+trap 'echo -e "\n${C_R}[FAIL]${C_N} 第 $LINENO 行出错，退出 / failed at line $LINENO"; exit 1' ERR
+CURL="curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2"
+
 # ---------- 安装 XRAY / Install XRAY (无GeoIP精简版 / no-geoip slim) ----------
 step "开始，安装XRAY / Install XRAY"
 mkdir -p "$WORKDIR" /usr/local/share/xray
-LATEST=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
-curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST}/Xray-linux-${XARCH}.zip"
-unzip -oq /tmp/xray.zip -d /tmp/xray-extract xray
+LATEST=$($CURL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+if [[ -z "$LATEST" ]]; then
+  fail "无法获取XRAY版本号（GitHub API限流或网络问题）/ failed to fetch XRAY version (GitHub API rate-limited or network issue)"
+fi
+DL_URL="https://github.com/XTLS/Xray-core/releases/download/${LATEST}/Xray-linux-${XARCH}.zip"
+$CURL -o /tmp/xray.zip "$DL_URL" || fail "下载XRAY失败 / failed to download XRAY from $DL_URL"
+[[ -s /tmp/xray.zip ]] || fail "下载文件为空 / downloaded file is empty: $DL_URL"
+unzip -oq /tmp/xray.zip -d /tmp/xray-extract xray || fail "解压失败 / unzip failed"
 install -m 755 /tmp/xray-extract/xray "$BIN"
 rm -rf /tmp/xray.zip /tmp/xray-extract
 ok
 
 # ---------- geodata / Updating geodata (mini版，节省内存 / mini, saves RAM) ----------
 step "加速，更新geodata / Updating geodata"
-curl -fsSL -o /usr/local/share/xray/geoip.dat \
-  https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip-only-cn-private.dat
-curl -fsSL -o /usr/local/share/xray/geosite.dat \
-  https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+$CURL -o /usr/local/share/xray/geoip.dat \
+  https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip-only-cn-private.dat \
+  || fail "geoip下载失败 / geoip download failed"
+$CURL -o /usr/local/share/xray/geosite.dat \
+  https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat \
+  || fail "geosite下载失败 / geosite download failed"
 ok
 
 # ---------- 生成密钥/UUID / Generate keys ----------
@@ -194,7 +205,7 @@ systemctl is-active --quiet xray && ok || fail "xray未运行 / xray not running
 echo "舒服了 / Done:"
 echo ""
 
-IP=$(curl -fsSL -4 https://api.ipify.org || curl -fsSL -6 https://api64.ipify.org)
+IP=$($CURL -4 https://api.ipify.org 2>/dev/null || $CURL -6 https://api64.ipify.org 2>/dev/null || echo "YOUR_SERVER_IP")
 LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#VLESS-REALITY-64MB"
 
 echo -e "${C_Y}${LINK}${C_N}"
