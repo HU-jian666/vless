@@ -1,234 +1,197 @@
-#!/bin/bash
-# 轻量 Xray VLESS Reality 零键安装脚本（适配 64MB 内存环境）
-# 风格参考 livingfree2023/nokey，完全自动化，可上传自用仓库
+#!/usr/bin/env bash
+#
+# https://github.com/YOURNAME/vless-reality-64mb
+# VLESS+REALITY 64MB内存优化一键安装 / 64MB RAM optimized one-click installer
+# 本脚本支持带参数执行，不带参数将使用默认配置 / See --help for parameters
+#
+set -euo pipefail
 
-set -e
-export DEBIAN_FRONTEND=noninteractive
+# ---------- 颜色 / Colors ----------
+C_G='\033[0;32m'; C_Y='\033[1;33m'; C_R='\033[0;31m'; C_B='\033[0;34m'; C_N='\033[0m'
+ok()   { echo -e "${C_G}[OK]${C_N}"; }
+fail() { echo -e "${C_R}[FAIL]${C_N}"; echo -e "${C_R}$1${C_N}"; exit 1; }
+step() { echo -ne "$1 ... "; }
 
-# 颜色
-red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'
-cyan='\033[0;36m'; magenta='\033[0;35m'; none='\033[0m'
+START_TS=$(date +%s)
 
-# 默认配置
-PORT=""
+# ---------- 默认参数 / Defaults ----------
+PORT=443
 UUID=""
-DOMAIN="www.microsoft.com"          # 常用 Reality 目标，可改
-NETSTACK="auto"                     # 4 / 6 / auto
-FORCE_GEODATA=0
-DRY_RUN=0
-SCRIPT_VERSION="2026.08-64mb"
+SNI="www.microsoft.com"
+SHORT_ID=""
+SWAP_MB=256
+WORKDIR="/usr/local/etc/xray"
+BIN="/usr/local/bin/xray"
 
-log()  { echo -e "${cyan}$1${none}"; }
-ok()   { echo -e "${green}$1 [OK]${none}"; }
-info() { echo -e "${yellow}$1${none}"; }
-err()  { echo -e "${red}$1${none}"; exit 1; }
+usage() {
+cat <<EOF
+用法 / Usage: $0 [options]
+  -p, --port <port>       监听端口 / listen port (default: 443)
+  -s, --sni <domain>      伪装域名 / camouflage SNI (default: www.microsoft.com)
+  -u, --uuid <uuid>       指定UUID / fixed UUID (default: random)
+  --no-swap               不创建swap / skip swapfile creation
+  -h, --help              显示帮助 / show this help
+EOF
+exit 0
+}
 
-# 解析参数
+NO_SWAP=0
 while [[ $# -gt 0 ]]; do
-  case $1 in
-    --port=*)       PORT="${1#*=}"; shift ;;
-    --uuid=*)       UUID="${1#*=}"; shift ;;
-    --domain=*)     DOMAIN="${1#*=}"; shift ;;
-    --netstack=*)   NETSTACK="${1#*=}"; shift ;;
-    --force)        FORCE_GEODATA=1; shift ;;
-    --dry-run)      DRY_RUN=1; shift ;;
-    --help|-h)
-      echo "用法: $0 [选项]"
-      echo "  --port=NUMBER     指定端口（默认随机 10000+）"
-      echo "  --uuid=STRING     指定 UUID（默认自动生成）"
-      echo "  --domain=DOMAIN   Reality SNI（默认 www.microsoft.com）"
-      echo "  --netstack=4|6    强制 IPv4/IPv6（默认自动）"
-      echo "  --force           强制更新 geodata"
-      echo "  --dry-run         仅预览，不修改系统"
-      echo "  --help            显示帮助"
-      exit 0
-      ;;
-    *) err "未知参数: $1  使用 --help 查看" ;;
+  case "$1" in
+    -p|--port) PORT="$2"; shift 2 ;;
+    -s|--sni) SNI="$2"; shift 2 ;;
+    -u|--uuid) UUID="$2"; shift 2 ;;
+    --no-swap) NO_SWAP=1; shift ;;
+    -h|--help) usage ;;
+    *) fail "未知参数 / unknown argument: $1" ;;
   esac
 done
 
-# 检查 root
-[[ $EUID -ne 0 ]] && err "请使用 root 运行（sudo -i）"
+[[ $EUID -eq 0 ]] || fail "请以root运行 / must run as root"
 
-# 检测架构
+# ---------- 工具链检查 / Tool check ----------
+step "工具链检查 / Tool check"
 ARCH=$(uname -m)
-case $ARCH in
-  x86_64|amd64) XRAY_ARCH="amd64" ;;
-  aarch64|arm64) XRAY_ARCH="arm64" ;;
-  *) err "不支持的架构: $ARCH" ;;
+case "$ARCH" in
+  x86_64) XARCH="64" ;;
+  aarch64) XARCH="arm64-v8a" ;;
+  armv7l) XARCH="arm32-v7a" ;;
+  *) fail "不支持的架构 / unsupported arch: $ARCH" ;;
 esac
-
-# 检测发行版（尽量兼容）
-if [[ -f /etc/os-release ]]; then
-  . /etc/os-release
-  OS=$ID
-else
-  OS="unknown"
-fi
-
-log "本脚本支持带参数执行，不带参数将直接无交互 / See --help for parameters"
-log "工具链检查 / Tool check ... "
-command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || yum install -y curl ca-certificates >/dev/null 2>&1 || true; }
-ok "工具链检查 / Tool check ... "
-
-# 安装目录
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_CONF="/usr/local/etc/xray/config.json"
-mkdir -p /usr/local/etc/xray /var/log/xray
-
-if [[ $DRY_RUN -eq 1 ]]; then
-  info "[DRY-RUN] 预览模式，不会真正安装"
-fi
-
-# 1. 安装 Xray（优先用官方预编译，失败再回退）
-log "开始，安装XRAY / Install XRAY ... "
-if [[ $DRY_RUN -eq 0 ]]; then
-  # 使用 XTLS 官方安装脚本（最稳）
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install > /tmp/xray-install.log 2>&1 || {
-    # 备用：直接下二进制（更省内存）
-    LATEST=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")' | head -1)
-    curl -L -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST}/Xray-linux-${XRAY_ARCH}.zip"
-    unzip -o /tmp/xray.zip -d /tmp/xray
-    mv /tmp/xray/xray $XRAY_BIN
-    chmod +x $XRAY_BIN
-    rm -rf /tmp/xray /tmp/xray.zip
+for c in curl unzip systemctl openssl; do
+  command -v "$c" >/dev/null 2>&1 || {
+    (command -v apt-get >/dev/null && apt-get update -qq && apt-get install -y -qq curl unzip openssl >/dev/null 2>&1) || \
+    (command -v yum >/dev/null && yum install -y -q curl unzip openssl >/dev/null 2>&1) || \
+    fail "缺少依赖且无法自动安装 / missing dep, auto-install failed: $c"
+    break
   }
-fi
-ok "开始，安装XRAY / Install XRAY ... "
+done
+ok
 
-# 2. geodata（可选跳过）
-log "加速，更新geodata / Updating geodata ... "
-if [[ $FORCE_GEODATA -eq 1 || ! -f /usr/local/share/xray/geoip.dat ]]; then
-  if [[ $DRY_RUN -eq 0 ]]; then
-    mkdir -p /usr/local/share/xray
-    curl -L -o /usr/local/share/xray/geoip.dat   https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
-    curl -L -o /usr/local/share/xray/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
-  fi
-fi
-ok "加速，更新geodata / Updating geodata ... "
-
-# 3. 生成密钥 & UUID & 端口
-log "快好了，手搓 / Configuring /usr/local/etc/xray/config.json ... "
-[[ -z $UUID ]] && UUID=$(cat /proc/sys/kernel/random/uuid)
-KEYS=$($XRAY_BIN x25519 2>/dev/null || echo "Private key: dummy
-Public key: dummy")
-PRIVATE_KEY=$(echo "$KEYS" | grep Private | awk '{print $3}')
-PUBLIC_KEY=$(echo "$KEYS" | grep Public | awk '{print $3}')
-SHORT_ID=$(openssl rand -hex 8 2>/dev/null || echo "0123456789abcdef")
-
-# 随机端口
-if [[ -z $PORT ]]; then
-  for i in {1..20}; do
-    PORT=$((10000 + RANDOM % 50000))
-    if ! ss -tuln | grep -q ":$PORT "; then break; fi
-  done
+# ---------- 内存不足时创建 swap / Create swap on low-RAM systems ----------
+TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+if [[ $NO_SWAP -eq 0 && $TOTAL_MEM_MB -lt 512 && ! -f /swapfile ]]; then
+  step "低内存，创建 ${SWAP_MB}MB swap / low RAM, creating ${SWAP_MB}MB swap"
+  fallocate -l ${SWAP_MB}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_MB status=none
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  ok
 fi
 
-# IP 检测
-if [[ $NETSTACK == "6" ]]; then
-  IP=$(curl -6 -s --connect-timeout 3 ifconfig.co || curl -6 -s icanhazip.com)
-elif [[ $NETSTACK == "4" ]]; then
-  IP=$(curl -4 -s --connect-timeout 3 ifconfig.co || curl -4 -s icanhazip.com)
-else
-  IP=$(curl -4 -s --connect-timeout 3 ifconfig.co 2>/dev/null || curl -6 -s --connect-timeout 3 ifconfig.co)
-fi
-[[ -z $IP ]] && IP=$(hostname -I | awk '{print $1}')
+# ---------- 安装 XRAY / Install XRAY (无GeoIP精简版 / no-geoip slim) ----------
+step "开始，安装XRAY / Install XRAY"
+mkdir -p "$WORKDIR" /usr/local/share/xray
+LATEST=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${LATEST}/Xray-linux-${XARCH}.zip"
+unzip -oq /tmp/xray.zip -d /tmp/xray-extract xray
+install -m 755 /tmp/xray-extract/xray "$BIN"
+rm -rf /tmp/xray.zip /tmp/xray-extract
+ok
 
-# 写配置
-cat > $XRAY_CONF <<EOF
+# ---------- geodata / Updating geodata (mini版，节省内存 / mini, saves RAM) ----------
+step "加速，更新geodata / Updating geodata"
+curl -fsSL -o /usr/local/share/xray/geoip.dat \
+  https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip-only-cn-private.dat
+curl -fsSL -o /usr/local/share/xray/geosite.dat \
+  https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+ok
+
+# ---------- 生成密钥/UUID / Generate keys ----------
+step "快好了，手搓 / Configuring ${WORKDIR}/config.json"
+[[ -z "$UUID" ]] && UUID=$("$BIN" uuid)
+[[ -z "$SHORT_ID" ]] && SHORT_ID=$(openssl rand -hex 8)
+KEYPAIR=$("$BIN" x25519)
+PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/Private/{print $3}')
+PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/Public/{print $3}')
+
+cat > "$WORKDIR/config.json" <<EOF
 {
-  "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
-  },
-  "inbounds": [
-    {
-      "listen": "0.0.0.0",
-      "port": ${PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${UUID}",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${DOMAIN}:443",
-          "xver": 0,
-          "serverNames": ["${DOMAIN}"],
-          "privateKey": "${PRIVATE_KEY}",
-          "shortIds": ["${SHORT_ID}", ""]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "0.0.0.0",
+    "port": ${PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${UUID}", "flow": "xtls-rprx-vision" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "${SNI}:443",
+        "xver": 0,
+        "serverNames": ["${SNI}"],
+        "privateKey": "${PRIVATE_KEY}",
+        "shortIds": ["${SHORT_ID}"]
       }
     }
-  ],
+  }],
   "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block"
-    }
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
   ]
 }
 EOF
-ok "快好了，手搓 / Configuring /usr/local/etc/xray/config.json ... "
+ok
 
-# 4. 启动服务
-log "中刺，开启服务 / Starting Service ... "
-if [[ $DRY_RUN -eq 0 ]]; then
-  systemctl enable xray >/dev/null 2>&1 || true
-  systemctl restart xray
-  sleep 1
-  systemctl is-active --quiet xray || err "xray 服务启动失败，请检查日志"
-fi
-ok "中刺，开启服务 / Starting Service ... "
+# ---------- systemd (内存硬限制 / hard memory cap) ----------
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target
 
-# 5. 开启 BBR
-log "最后，打开BBR / Finishing, Enabling BBR ... "
-if [[ $DRY_RUN -eq 0 ]]; then
-  if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-    cat >> /etc/sysctl.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+[Service]
+User=root
+ExecStart=${BIN} run -config ${WORKDIR}/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=32768
+MemoryMax=48M
+MemoryHigh=40M
+TasksMax=64
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
 EOF
-    sysctl -p >/dev/null 2>&1 || true
-  fi
+
+step "冲刺，开启服务 / Starting Service"
+systemctl daemon-reload
+systemctl enable xray >/dev/null 2>&1
+systemctl restart xray
+sleep 1
+systemctl is-active --quiet xray || fail "服务启动失败，查看 / service failed, check: journalctl -u xray -e"
+ok
+
+# ---------- BBR ----------
+step "最后，打开BBR / Finishing, Enabling BBR"
+if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+  echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+  echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+  sysctl -p >/dev/null 2>&1 || true
 fi
-ok "最后，打开BBR / Finishing, Enabling BBR ... "
+ok
 
-# 6. 检查状态
-log "检查服务状态 / Checking Service ... "
-if [[ $DRY_RUN -eq 0 ]]; then
-  systemctl is-active --quiet xray && ok "检查服务状态 / Checking Service ... " || err "服务异常"
-else
-  ok "检查服务状态 / Checking Service ... "
-fi
+# ---------- 检查服务状态 / Checking Service ----------
+step "检查服务状态 / Checking Service"
+systemctl is-active --quiet xray && ok || fail "xray未运行 / xray not running"
 
-# 输出链接
-VLESS_URL="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#live-free-or-die-hard"
+echo "舒服了 / Done:"
+echo ""
 
-echo
-echo -e "${magenta}${VLESS_URL}${none}"
-echo
-info "总用时 / Elapsed Time: 约几秒"
-echo "--------- live free or die hard ---------"
-echo
-info "配置文件: $XRAY_CONF"
-info "日志: /var/log/xray/"
-info "重启: systemctl restart xray"
-info "卸载: systemctl stop xray && systemctl disable xray && rm -rf /usr/local/bin/xray /usr/local/etc/xray"
+IP=$(curl -fsSL -4 https://api.ipify.org || curl -fsSL -6 https://api64.ipify.org)
+LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#VLESS-REALITY-64MB"
+
+echo -e "${C_Y}${LINK}${C_N}"
+echo ""
+echo "内存占用限制 / Memory cap: 48MB (MemoryMax)"
+echo "配置文件 / Config: ${WORKDIR}/config.json"
+
+END_TS=$(date +%s)
+echo ""
+echo "总用时 / Elapsed Time:  $((END_TS - START_TS)) 秒"
+echo "---------- live free or die hard --------------"
