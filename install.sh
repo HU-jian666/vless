@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# https://github.com/yourname/xray-vless-reality-nokey
-# 全自动安装 Xray (VLESS + XTLS-Reality)
-# 无需域名、无需证书、无需交互、不创建 swap（适配小硬盘 NAT VPS）
-# Fully automatic Xray (VLESS + XTLS-Reality) installer
-# No domain, no cert, no prompts, no swap file (for tiny-disk NAT VPS)
+# https://github.com/yourname/singbox-tuic-nokey
+# 全自动安装 sing-box + TUIC v5
+# 无需域名（自签证书）、无需交互、不创建 swap，适配 NAT VPS 随机端口 + 小内存/小硬盘
+# Fully automatic sing-box + TUIC v5 installer
+# No domain (self-signed cert), no prompts, no swap file — for NAT VPS random port + low RAM/disk
 #
 # 用法 / Usage:
 #   bash install.sh          直接运行，全自动完成安装 / just run it, fully automatic
@@ -20,70 +20,88 @@ START_TS=$(date +%s)
 
 # ---------- 参数（全部自动生成，无需输入） / All auto-generated, no input needed ----------
 PORT=$(shuf -i 20000-60000 -n 1)      # NAT VPS 随机高位端口 / random high port for NAT VPS
-SNI="www.microsoft.com"
+SNI="www.bing.com"                    # 仅用于证书 CN 和客户端 SNI 字段，不需要真实解析 / only used as cert CN & client SNI field, no real DNS needed
 UUID=""
-XRAY_DIR="/usr/local/etc/xray"
-SERVICE_NAME="xray"
+PASSWORD=""
+CONFIG_DIR="/usr/local/etc/sing-box"
+CERT_DIR="${CONFIG_DIR}/cert"
+BIN_PATH="/usr/local/bin/sing-box"
+SERVICE_NAME="sing-box"
 
 [[ $EUID -ne 0 ]] && err "请使用 root 运行此脚本 / Please run this script as root"
 
 # ---------- 1. 工具链检查 / Tool check ----------
 echo "工具链检查 / Tool check ..."
-for cmd in curl systemctl openssl shuf; do
-  command -v "$cmd" >/dev/null 2>&1 || err "缺少依赖: $cmd / Missing dependency: $cmd"
+for cmd in curl tar systemctl openssl shuf uuidgen; do
+  command -v "$cmd" >/dev/null 2>&1 || { [[ "$cmd" == "uuidgen" ]] && continue; err "缺少依赖: $cmd / Missing dependency: $cmd"; }
 done
 ok
 
-# ---------- 2. 安装 XRAY / Install XRAY ----------
-echo "开始，安装 XRAY / Install XRAY ..."
-bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1 \
-  || err "Xray 安装失败 / Xray install failed"
+# ---------- 2. 安装 sing-box / Install sing-box ----------
+echo "开始，安装 sing-box / Install sing-box ..."
+case "$(uname -m)" in
+  x86_64|amd64) ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  armv7l) ARCH="armv7" ;;
+  *) err "不支持的架构: $(uname -m) / Unsupported architecture" ;;
+esac
+
+LATEST_TAG=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+[[ -z "$LATEST_TAG" ]] && err "获取 sing-box 版本失败 / Failed to fetch sing-box release info"
+VER="${LATEST_TAG#v}"
+ASSET="sing-box-${VER}-linux-${ARCH}.tar.gz"
+TMP_DIR=$(mktemp -d)
+curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/${ASSET}" -o "${TMP_DIR}/sb.tar.gz" \
+  || err "sing-box 下载失败 / sing-box download failed"
+tar -xzf "${TMP_DIR}/sb.tar.gz" -C "$TMP_DIR"
+install -m 755 "${TMP_DIR}/sing-box-${VER}-linux-${ARCH}/sing-box" "$BIN_PATH"
+rm -rf "$TMP_DIR"
 ok
 
 # ---------- 3. 生成参数 / Generate parameters ----------
-# 跳过 geodata 下载：本配置不使用 geoip/geosite 路由规则，省磁盘 / geodata skipped, saves disk, not used by this minimal config
 echo "生成密钥与参数 / Generating keys & parameters ..."
-UUID=$(xray uuid)
-KEYPAIR=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/Private/{print $3}')
-PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/Public/{print $3}')
-SHORT_ID=$(openssl rand -hex 8)
+if command -v uuidgen >/dev/null 2>&1; then
+  UUID=$(uuidgen)
+else
+  UUID=$("$BIN_PATH" generate uuid)
+fi
+PASSWORD=$(openssl rand -hex 16)
+
+mkdir -p "$CERT_DIR"
+openssl ecparam -genkey -name prime256v1 -out "${CERT_DIR}/private.key" >/dev/null 2>&1
+openssl req -new -x509 -days 3650 -key "${CERT_DIR}/private.key" \
+  -out "${CERT_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 ok
 
 # ---------- 4. 配置 config.json / Configuring config.json ----------
-echo "快到了，手搓 / Configuring ${XRAY_DIR}/config.json ..."
-mkdir -p "$XRAY_DIR"
-cat > "${XRAY_DIR}/config.json" <<EOF
+echo "快到了，手搓 / Configuring ${CONFIG_DIR}/config.json ..."
+mkdir -p "$CONFIG_DIR"
+cat > "${CONFIG_DIR}/config.json" <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": { "level": "warn" },
   "inbounds": [
     {
-      "listen": "0.0.0.0",
-      "port": ${PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          { "id": "${UUID}", "flow": "xtls-rprx-vision" }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${SNI}:443",
-          "xver": 0,
-          "serverNames": ["${SNI}"],
-          "privateKey": "${PRIVATE_KEY}",
-          "shortIds": ["${SHORT_ID}"]
+      "type": "tuic",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "uuid": "${UUID}",
+          "password": "${PASSWORD}"
         }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "${CERT_DIR}/cert.pem",
+        "key_path": "${CERT_DIR}/private.key"
       }
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
   ]
 }
 EOF
@@ -91,15 +109,22 @@ ok
 
 # ---------- 5. 启动服务 / Starting service ----------
 echo "冲刺，开启服务 / Starting Service ..."
-# 小内存机器加内存上限保护，防止进程异常占满内存拖死系统（不占用磁盘）
-# Memory cap for low-RAM boxes so a runaway process can't take the system down (costs no disk)
-mkdir -p "/etc/systemd/system/${SERVICE_NAME}.service.d"
-cat > "/etc/systemd/system/${SERVICE_NAME}.service.d/override.conf" <<EOF
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=sing-box service
+After=network.target
+
 [Service]
-MemoryMax=48M
-MemoryHigh=40M
+Type=simple
+ExecStart=${BIN_PATH} run -c ${CONFIG_DIR}/config.json
 Restart=on-failure
 RestartSec=3
+LimitNOFILE=infinity
+MemoryMax=48M
+MemoryHigh=40M
+
+[Install]
+WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
@@ -126,15 +151,17 @@ systemctl is-active --quiet "$SERVICE_NAME" && ok || err "服务未运行 / Serv
 PUBLIC_IP=$(curl -fsSL4 https://api.ipify.org || curl -fsSL https://ifconfig.me) \
   || err "无法探测公网 IP / Could not detect public IP"
 
-LINK="vless://${UUID}@${PUBLIC_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Reality-${PUBLIC_IP}"
+LINK="tuic://${UUID}:${PASSWORD}@${PUBLIC_IP}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1#TUIC-${PUBLIC_IP}"
 
 echo ""
 echo "舒服了 / Done:"
 echo ""
 echo "$LINK"
 echo ""
-echo -e "${YELLOW}若为 NAT VPS，请到服务商后台把上面端口 ${PORT} 做端口转发（外部端口->本机 ${PORT}），并把分享链接中的端口换成对外映射端口${NC}"
-echo -e "${YELLOW}If this is a NAT VPS, forward the port above (${PORT}) at your provider's panel, and replace the port in the share link with the mapped public port${NC}"
+echo -e "${YELLOW}证书为自签，客户端必须开启 \"跳过证书验证 / allow_insecure\" 才能连接${NC}"
+echo -e "${YELLOW}Certificate is self-signed — client must enable \"skip cert verify / allow_insecure\" to connect${NC}"
+echo -e "${YELLOW}若为 NAT VPS，请到服务商后台把端口 ${PORT}（TCP+UDP）做转发，并把链接里的端口换成对外映射端口${NC}"
+echo -e "${YELLOW}If this is a NAT VPS, forward port ${PORT} (TCP+UDP) at your provider's panel and replace the port in the link with the mapped public port${NC}"
 echo ""
 
 END_TS=$(date +%s)
