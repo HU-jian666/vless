@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
 # ============================================================
-# Xray VLESS + REALITY 一键安装
+# Xray VLESS + REALITY
 # LOW MEMORY / RANDOM PORT / FULL AUTO
+#
+# 适用于：
+#   64MB / 128MB VPS
+#   Debian / Ubuntu
+#   amd64
+#
+# 特点：
+#   1. 不使用 install-release.sh
+#   2. 直接下载官方 Xray Release
+#   3. 不安装 geodata
+#   4. 随机 TCP 端口
+#   5. 自动 UUID
+#   6. 自动 Reality Key
+#   7. 自动 Short ID
+#   8. 自动 systemd
+#   9. 自动 BBR
+#  10. 自动防火墙
+#  11. 自动输出 VLESS
 # ============================================================
 
 set -Eeuo pipefail
@@ -19,12 +37,15 @@ XRAY_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_INFO="/root/xray-info.txt"
 
+TMP_DIR="/tmp/xray-lowmem"
+
 PORT=""
 UUID=""
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
 SERVER_IP=""
+MEM_MB=""
 
 # ============================================================
 # 颜色
@@ -75,53 +96,66 @@ echo "============================================================"
 echo
 
 # ============================================================
-# 内存检测
+# 清理旧临时文件
+# ============================================================
+
+rm -rf "${TMP_DIR}" 2>/dev/null || true
+mkdir -p "${TMP_DIR}"
+
+# ============================================================
+# 检查内存
 # ============================================================
 
 msg "内存检测 / Checking Memory ..."
 
 MEM_MB="$(
-    awk '/MemTotal/ {
-        printf "%d\n",$2/1024
-    }' /proc/meminfo
+    awk '
+    /MemTotal/ {
+        printf "%d\n", $2 / 1024
+    }
+    ' /proc/meminfo
 )"
 
-if [[ -z "${MEM_MB}" ]]; then
-    die "无法读取内存"
-fi
+[[ -n "${MEM_MB}" ]] || die "无法获取内存"
 
 msg "${OK} ${MEM_MB} MB"
 
+if (( MEM_MB <= 80 )); then
+    msg "${WARN} LOW MEMORY MODE"
+fi
+
 # ============================================================
-# 架构检测
+# 架构
 # ============================================================
 
 msg "架构检测 / Detecting Architecture ..."
 
-case "$(uname -m)" in
+MACHINE="$(uname -m)"
+
+case "${MACHINE}" in
 
     x86_64|amd64)
-        ARCH="amd64"
+        XRAY_ARCH="64"
         ;;
 
     aarch64|arm64)
-        ARCH="arm64-v8a"
+        XRAY_ARCH="arm64-v8a"
         ;;
 
     armv7l)
-        ARCH="arm32-v7a"
+        XRAY_ARCH="arm32-v7a"
         ;;
 
     *)
-        die "不支持的架构: $(uname -m)"
+        die "不支持的架构: ${MACHINE}"
         ;;
 
 esac
 
-msg "${OK} ${ARCH}"
+msg "${OK} ${MACHINE}"
 
 # ============================================================
-# 系统检测
+# 系统
 # ============================================================
 
 msg "系统检测 / Detecting OS ..."
@@ -129,7 +163,7 @@ msg "系统检测 / Detecting OS ..."
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
 else
-    die "无法识别系统"
+    die "无法读取 /etc/os-release"
 fi
 
 OS_ID="${ID:-unknown}"
@@ -137,57 +171,42 @@ OS_ID="${ID:-unknown}"
 msg "${OK} ${OS_ID}"
 
 # ============================================================
-# 工具链
+# 工具检查
+# 尽量不执行 apt update，避免低内存环境产生额外压力
 # ============================================================
 
 msg "工具链检查 / Tool Check ..."
 
-export DEBIAN_FRONTEND=noninteractive
+missing_tools=()
 
-case "${OS_ID}" in
+command -v curl >/dev/null 2>&1 || missing_tools+=("curl")
+command -v openssl >/dev/null 2>&1 || missing_tools+=("openssl")
+command -v unzip >/dev/null 2>&1 || missing_tools+=("unzip")
+command -v ss >/dev/null 2>&1 || missing_tools+=("iproute2")
 
-    debian|ubuntu)
+if (( ${#missing_tools[@]} > 0 )); then
 
-        apt-get update -y \
-            >/dev/null 2>&1 \
-            || true
+    case "${OS_ID}" in
 
-        apt-get install -y \
-            curl \
-            ca-certificates \
-            openssl \
-            iproute2 \
-            procps \
-            >/dev/null 2>&1
+        debian|ubuntu)
 
-        ;;
+            # 仅安装缺失工具，不执行 apt update
+            apt-get install -y \
+                "${missing_tools[@]}" \
+                >/dev/null 2>&1 \
+                || die "无法安装必要工具"
 
-    centos|rhel|rocky|almalinux|fedora)
+            ;;
 
-        if command -v dnf >/dev/null 2>&1; then
-            PKG="dnf"
-        else
-            PKG="yum"
-        fi
+        *)
 
-        "${PKG}" install -y \
-            curl \
-            ca-certificates \
-            openssl \
-            iproute \
-            procps \
-            >/dev/null 2>&1 \
-            || true
+            die "缺少必要工具: ${missing_tools[*]}"
 
-        ;;
+            ;;
 
-    *)
+    esac
 
-        msg "${WARN} 未识别系统，继续尝试"
-
-        ;;
-
-esac
+fi
 
 msg "${OK}"
 
@@ -214,38 +233,40 @@ port_used() {
     fi
 }
 
+PORT=""
+
 for _ in $(seq 1 100); do
 
     if command -v shuf >/dev/null 2>&1; then
 
-        TEST_PORT="$(
+        CANDIDATE="$(
             shuf -i 10000-60000 -n 1
         )"
 
     else
 
-        TEST_PORT="$(
+        CANDIDATE="$(
             awk 'BEGIN {
                 srand();
-                print int(10000+rand()*50001)
+                print int(10000 + rand() * 50001)
             }'
         )"
 
     fi
 
-    if ! port_used "${TEST_PORT}"; then
-        PORT="${TEST_PORT}"
+    if ! port_used "${CANDIDATE}"; then
+        PORT="${CANDIDATE}"
         break
     fi
 
 done
 
-[[ -n "${PORT}" ]] || die "无法生成随机端口"
+[[ -n "${PORT}" ]] || die "随机端口生成失败"
 
 msg "${OK} Random Port: ${PORT}"
 
 # ============================================================
-# 停止旧服务
+# 检查旧 Xray
 # ============================================================
 
 msg "检查旧服务 / Checking Existing Xray ..."
@@ -254,27 +275,92 @@ systemctl stop xray.service \
     >/dev/null 2>&1 \
     || true
 
+pkill -x xray \
+    >/dev/null 2>&1 \
+    || true
+
 msg "${OK}"
 
 # ============================================================
-# 安装 Xray
+# 直接下载官方 Xray Release
 # ============================================================
 
-msg "开始，安装 XRAY / Installing XRAY ..."
+msg "开始，下载 XRAY / Downloading XRAY ..."
 
-# 使用 Xray 官方推荐方式
-bash -c "$(
-    curl -fsSL \
-    https://github.com/XTLS/Xray-install/raw/main/install-release.sh
-)" @ install --without-geodata \
-    >/tmp/xray-install.log 2>&1 \
-    || {
-        cat /tmp/xray-install.log
-        die "Xray 安装失败"
-    }
+mkdir -p "${TMP_DIR}"
+
+XRAY_ZIP="${TMP_DIR}/xray.zip"
+
+case "${XRAY_ARCH}" in
+
+    64)
+
+        XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+
+        ;;
+
+    arm64-v8a)
+
+        XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
+
+        ;;
+
+    arm32-v7a)
+
+        XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm32-v7a.zip"
+
+        ;;
+
+    *)
+
+        die "不支持的 Xray 架构"
+
+        ;;
+
+esac
+
+curl -4fL \
+    --connect-timeout 10 \
+    --retry 2 \
+    --max-time 120 \
+    "${XRAY_URL}" \
+    -o "${XRAY_ZIP}" \
+    || die "Xray 下载失败"
+
+[[ -s "${XRAY_ZIP}" ]] \
+    || die "Xray 下载文件为空"
+
+msg "${OK}"
+
+# ============================================================
+# 解压
+# ============================================================
+
+msg "解压 XRAY / Extracting XRAY ..."
+
+unzip -oq \
+    "${XRAY_ZIP}" \
+    xray \
+    -d "${TMP_DIR}" \
+    >/dev/null 2>&1 \
+    || die "Xray 解压失败"
+
+[[ -f "${TMP_DIR}/xray" ]] \
+    || die "解压后没有找到 xray"
+
+# ============================================================
+# 安装二进制
+# ============================================================
+
+install -m 755 \
+    "${TMP_DIR}/xray" \
+    "${XRAY_BIN}"
 
 [[ -x "${XRAY_BIN}" ]] \
-    || die "Xray 二进制文件不存在"
+    || die "Xray 二进制安装失败"
+
+# 删除压缩包
+rm -f "${XRAY_ZIP}"
 
 msg "${OK}"
 
@@ -287,6 +373,16 @@ mkdir -p "${XRAY_DIR}"
 chmod 755 "${XRAY_DIR}"
 
 # ============================================================
+# 获取 Xray 版本
+# ============================================================
+
+XRAY_VERSION="$(
+    "${XRAY_BIN}" version 2>/dev/null |
+    head -n 1 |
+    tr -d '\r'
+)"
+
+# ============================================================
 # UUID
 # ============================================================
 
@@ -296,7 +392,8 @@ UUID="$(
     cat /proc/sys/kernel/random/uuid
 )"
 
-[[ -n "${UUID}" ]] || die "UUID 生成失败"
+[[ -n "${UUID}" ]] \
+    || die "UUID 生成失败"
 
 msg "${OK}"
 
@@ -322,9 +419,11 @@ PUBLIC_KEY="$(
     head -n 1
 )"
 
-[[ -n "${PRIVATE_KEY}" ]] || die "Private Key 生成失败"
+[[ -n "${PRIVATE_KEY}" ]] \
+    || die "Private Key 生成失败"
 
-[[ -n "${PUBLIC_KEY}" ]] || die "Public Key 生成失败"
+[[ -n "${PUBLIC_KEY}" ]] \
+    || die "Public Key 生成失败"
 
 msg "${OK}"
 
@@ -338,34 +437,35 @@ SHORT_ID="$(
     openssl rand -hex 8
 )"
 
-[[ -n "${SHORT_ID}" ]] || die "Short ID 生成失败"
+[[ -n "${SHORT_ID}" ]] \
+    || die "Short ID 生成失败"
 
 msg "${OK}"
 
 # ============================================================
-# 公网 IP
+# 获取公网 IP
 # ============================================================
 
 msg "检测公网 IP / Detecting Public IP ..."
 
 SERVER_IP="$(
     curl -4fsSL \
-    --connect-timeout 3 \
-    --max-time 5 \
-    https://api.ipify.org \
-    2>/dev/null \
-    || true
+        --connect-timeout 3 \
+        --max-time 5 \
+        https://api.ipify.org \
+        2>/dev/null \
+        || true
 )"
 
 if [[ -z "${SERVER_IP}" ]]; then
 
     SERVER_IP="$(
         curl -4fsSL \
-        --connect-timeout 3 \
-        --max-time 5 \
-        https://ifconfig.me \
-        2>/dev/null \
-        || true
+            --connect-timeout 3 \
+            --max-time 5 \
+            https://ifconfig.me \
+            2>/dev/null \
+            || true
     )"
 
 fi
@@ -380,12 +480,12 @@ if [[ -z "${SERVER_IP}" ]]; then
 fi
 
 [[ -n "${SERVER_IP}" ]] \
-    || die "无法获取服务器 IP"
+    || die "无法获取公网 IP"
 
 msg "${OK} ${SERVER_IP}"
 
 # ============================================================
-# 配置 Xray
+# 配置
 # ============================================================
 
 msg "快速配置，手搓 / Configuring ${XRAY_CONFIG} ..."
@@ -457,10 +557,10 @@ chmod 600 "${XRAY_CONFIG}"
 msg "${OK}"
 
 # ============================================================
-# 检查配置
+# 配置测试
 # ============================================================
 
-msg "配置检查 / Checking Config ..."
+msg "检查配置 / Checking Config ..."
 
 "${XRAY_BIN}" run \
     -test \
@@ -474,22 +574,38 @@ msg "配置检查 / Checking Config ..."
 msg "${OK}"
 
 # ============================================================
-# systemd 低内存优化
+# systemd 服务
 # ============================================================
 
-msg "低内存优化 / Optimizing Memory ..."
+msg "创建服务 / Creating Service ..."
 
-mkdir -p /etc/systemd/system/xray.service.d
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target
 
-cat > /etc/systemd/system/xray.service.d/override.conf <<EOF
 [Service]
-MemoryHigh=40M
-MemoryMax=48M
+Type=simple
+
+User=root
+Group=root
+
+ExecStart=${XRAY_BIN} run -config ${XRAY_CONFIG}
+
 Restart=always
 RestartSec=2
+
+MemoryHigh=40M
+MemoryMax=48M
+
 LimitNOFILE=65535
 LimitCORE=0
+
 OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
@@ -502,11 +618,11 @@ msg "${OK}"
 
 msg "最后，打开 BBR / Finishing, Enabling BBR ..."
 
-if command -v sysctl >/dev/null 2>&1; then
+if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+fi
 
-    modprobe tcp_bbr \
-        >/dev/null 2>&1 \
-        || true
+if command -v sysctl >/dev/null 2>&1; then
 
     sysctl -w \
         net.core.default_qdisc=fq \
@@ -521,10 +637,11 @@ if command -v sysctl >/dev/null 2>&1; then
 fi
 
 BBR_STATUS="$(
-    sysctl -n \
-    net.ipv4.tcp_congestion_control \
-    2>/dev/null \
-    || echo "unknown"
+    sysctl \
+        -n \
+        net.ipv4.tcp_congestion_control \
+        2>/dev/null \
+        || echo "unknown"
 )"
 
 msg "${OK}"
@@ -561,7 +678,7 @@ fi
 msg "${OK}"
 
 # ============================================================
-# 启动服务
+# 启动
 # ============================================================
 
 msg "启动服务 / Starting Service ..."
@@ -577,7 +694,7 @@ sleep 2
 msg "${OK}"
 
 # ============================================================
-# 检查服务状态
+# 服务检查
 # ============================================================
 
 msg "检查服务状态 / Checking Service ..."
@@ -589,7 +706,6 @@ if systemctl is-active --quiet xray.service; then
 else
 
     echo
-
     journalctl \
         -u xray.service \
         --no-pager \
@@ -601,7 +717,7 @@ else
 fi
 
 # ============================================================
-# 检查端口
+# 检查监听
 # ============================================================
 
 if command -v ss >/dev/null 2>&1; then
@@ -620,7 +736,7 @@ if command -v ss >/dev/null 2>&1; then
 fi
 
 # ============================================================
-# 生成 VLESS
+# VLESS
 # ============================================================
 
 VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Xray-Reality"
@@ -633,6 +749,9 @@ cat > "${XRAY_INFO}" <<EOF
 ============================================================
 Xray VLESS REALITY
 ============================================================
+
+Xray:
+${XRAY_VERSION}
 
 IP:
 ${SERVER_IP}
@@ -670,11 +789,17 @@ EOF
 chmod 600 "${XRAY_INFO}"
 
 # ============================================================
+# 删除临时文件
+# ============================================================
+
+rm -rf "${TMP_DIR}" 2>/dev/null || true
+rm -f /tmp/xray-config-test.log 2>/dev/null || true
+
+# ============================================================
 # 时间
 # ============================================================
 
 END_TIME="$(date +%s)"
-
 ELAPSED=$((END_TIME - START_TIME))
 
 # ============================================================
@@ -687,6 +812,7 @@ echo "舒服了 / Done:"
 echo "============================================================"
 echo
 
+echo "Xray     : ${XRAY_VERSION}"
 echo "IP       : ${SERVER_IP}"
 echo "PORT     : ${PORT}"
 echo "UUID     : ${UUID}"
