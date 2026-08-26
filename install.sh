@@ -1,143 +1,241 @@
 #!/bin/bash
-# VLESS + XTLS-Reality 一键安装脚本 / One-command VLESS+REALITY installer
-# https://github.com/<YOUR_GH_USER>/<YOUR_REPO>
-set -uo pipefail
+# ================================================================
+#  VLESS + REALITY + XRAY  一键安装脚本
+#  One-click installer for VLESS + REALITY + Xray
+#  https://github.com/YOUR_USERNAME/YOUR_REPO
+#
+#  本脚本支持带参数执行，不带参数将直接无敌
+#  See --help for parameters
+# ================================================================
 
-# ---------------------------------------------------------------------------
-# 常量 / Constants
-# ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.0.0"
-readonly XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-readonly CONFIG_PATH="/usr/local/etc/xray/config.json"
-readonly SERVICE_NAME="xray"
-readonly DEFAULT_SNI="www.microsoft.com"
-readonly LOG_FILE="/var/log/vless-installer.log"
+set -euo pipefail
 
-port=""
-uuid=""
-sni="$DEFAULT_SNI"
-netstack="auto"
-dry_run=0
+# ── 颜色 / Colors ─────────────────────────────────────────────
+RED='\033[0;31m';   GREEN='\033[0;32m';  YELLOW='\033[1;33m'
+CYAN='\033[0;36m';  PINK='\033[0;35m';   BOLD='\033[1m';  NC='\033[0m'
 
-if [[ -t 1 ]]; then
-    red='\e[91m'; green='\e[92m'; yellow='\e[93m'; cyan='\e[96m'; magenta='\e[95m'; none='\e[0m'
-else
-    red=''; green=''; yellow=''; cyan=''; magenta=''; none=''
-fi
+ok()   { echo -e "${GREEN}[OK]${NC}  $*"; }
+info() { echo -e "${CYAN}[..]${NC}  $*"; }
+warn() { echo -e "${YELLOW}[!!]${NC}  $*"; }
+die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# 输出辅助函数 / Output helpers (matches the [OK] step style)
-# ---------------------------------------------------------------------------
-task_start() { echo -n -e "${yellow}$1${none} ... " | tee -a "$LOG_FILE"; }
-task_done()  { echo -e "[${green}OK${none}]" | tee -a "$LOG_FILE"; }
-task_fail()  { echo -e "[${red}FAILED${none}]" | tee -a "$LOG_FILE"; }
-info()       { echo -e "${cyan}$1${none}" | tee -a "$LOG_FILE"; }
-die()        { echo -e "\n${red}$1${none}\n" | tee -a "$LOG_FILE"; exit 1; }
-
+# ── Banner ────────────────────────────────────────────────────
 banner() {
-    echo -e "${cyan}https://github.com/<YOUR_GH_USER>/<YOUR_REPO>${none}"
-    echo "本脚本支持带参数执行，不带参数将直接安装 / See --help for parameters"
+    echo ""
+    echo -e "  ${PINK}https://github.com/YOUR_USERNAME/YOUR_REPO${NC}"
+    echo -e "  本脚本支持带参数执行，不带参数将直接无敌 / See ${CYAN}--help${NC} for parameters"
+    echo ""
 }
 
-show_help() {
+# ── 帮助 / Help ───────────────────────────────────────────────
+usage() {
+    banner
     cat <<EOF
-用法 / Usage: $0 [options]
-  --port=NUMBER     指定端口 (默认: 随机) / Set port (default: random)
-  --uuid=STRING     指定UUID (默认: 自动生成) / Set UUID (default: auto)
-  --sni=DOMAIN      指定REALITY SNI (默认: ${DEFAULT_SNI}) / Set REALITY SNI
-  --netstack=4|6    强制IPv4或IPv6 (默认: 自动) / Force IPv4/IPv6
-  --dry-run         仅预览，不做任何更改 / Preview only, no changes
-  --help            显示本帮助 / Show this help
+  ${BOLD}用法 / Usage:${NC}
+    bash install.sh [选项]
+
+  ${BOLD}选项 / Options:${NC}
+    --port    PORT     监听端口        (默认随机 10000-65535)
+    --domain  DOMAIN   伪装域名        (默认 www.apple.com)
+    --uuid    UUID     自定义 UUID     (默认随机生成)
+    --uninstall        卸载 Xray 及配置
+    --help             显示此帮助
+
+  ${BOLD}示例 / Examples:${NC}
+    bash install.sh
+    bash install.sh --port 443 --domain www.bing.com
+    bash install.sh --uuid xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    bash install.sh --uninstall
+
 EOF
     exit 0
 }
 
-parse_args() {
-    for arg in "$@"; do
-        case "$arg" in
-            --port=*) port="${arg#*=}" ;;
-            --uuid=*) uuid="${arg#*=}" ;;
-            --sni=*) sni="${arg#*=}" ;;
-            --netstack=*) netstack="${arg#*=}" ;;
-            --dry-run) dry_run=1 ;;
-            --help) show_help ;;
-            *) die "未知参数: $arg / Unknown option: $arg" ;;
-        esac
+# ── 参数解析 / Argument parsing ───────────────────────────────
+PORT=""
+DOMAIN="www.apple.com"
+UUID_CUSTOM=""
+UNINSTALL=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)      PORT="$2";         shift 2 ;;
+        --domain)    DOMAIN="$2";       shift 2 ;;
+        --uuid)      UUID_CUSTOM="$2";  shift 2 ;;
+        --uninstall) UNINSTALL=true;    shift   ;;
+        --help|-h)   usage ;;
+        *) die "未知参数 / Unknown argument: $1" ;;
+    esac
+done
+
+# ── 计时 / Timer ──────────────────────────────────────────────
+START_TS=$(date +%s)
+elapsed() { echo $(( $(date +%s) - START_TS )); }
+
+# ── 系统工具 / Utils ──────────────────────────────────────────
+require_root() {
+    [[ $EUID -eq 0 ]] || die "请以 root 运行 / Please run as root"
+}
+
+detect_os() {
+    if   [[ -f /etc/alpine-release ]]; then echo "alpine"
+    elif [[ -f /etc/debian_version ]]; then echo "debian"
+    elif [[ -f /etc/redhat-release ]]; then echo "redhat"
+    else die "不支持的系统 / Unsupported OS"; fi
+}
+
+pkg_install() {
+    local os; os=$(detect_os)
+    case "$os" in
+        alpine) apk add --quiet "$@" >/dev/null 2>&1 ;;
+        debian) apt-get update -qq && apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
+        redhat) yum install -y -q "$@" >/dev/null 2>&1 ;;
+    esac
+}
+
+gen_uuid() {
+    command -v uuidgen &>/dev/null \
+        && uuidgen | tr '[:upper:]' '[:lower:]' \
+        || cat /proc/sys/kernel/random/uuid
+}
+
+gen_port() {
+    local p
+    while true; do
+        p=$(shuf -i 10000-65535 -n 1 2>/dev/null \
+            || awk 'BEGIN{srand();print int(rand()*55535)+10000}')
+        ss -tuln 2>/dev/null | grep -q ":$p " || { echo "$p"; return; }
     done
 }
 
-# ---------------------------------------------------------------------------
-# 步骤1：工具链检查 / Tool check
-# ---------------------------------------------------------------------------
-step_tool_check() {
-    task_start "工具链检查 / Tool check"
-    [[ "$EUID" -ne 0 ]] && { task_fail; die "请以root身份运行 / Please run as root"; }
-    for tool in curl systemctl; do
-        command -v "$tool" >/dev/null 2>&1 || { task_fail; die "缺少依赖: $tool / Missing dependency: $tool"; }
-    done
-    command -v jq >/dev/null 2>&1 || {
-        apt-get update -y >>"$LOG_FILE" 2>&1 || yum install -y jq >>"$LOG_FILE" 2>&1 || true
-        apt-get install -y jq curl uuid-runtime >>"$LOG_FILE" 2>&1 || true
-    }
-    task_done
+get_ip() {
+    SERVER_IP=$(
+        curl -4fsSL --retry 3 --connect-timeout 5 https://api.ipify.org 2>/dev/null ||
+        curl -4fsSL --retry 2 --connect-timeout 5 https://ifconfig.me  2>/dev/null ||
+        hostname -I | awk '{print $1}'
+    )
 }
 
-# ---------------------------------------------------------------------------
-# 步骤2：安装 XRAY / Install XRAY
-# ---------------------------------------------------------------------------
-step_install_xray() {
-    task_start "开始，安装 XRAY / Install XRAY"
-    bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ install >>"$LOG_FILE" 2>&1 \
-        || { task_fail; die "Xray安装失败，查看 $LOG_FILE / Xray install failed, see $LOG_FILE"; }
-    task_done
-}
-
-# ---------------------------------------------------------------------------
-# 步骤3：更新 geodata / Update geodata
-# ---------------------------------------------------------------------------
-step_update_geodata() {
-    task_start "加速，更新geodata / Updating geodata"
-    bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ install-geodata >>"$LOG_FILE" 2>&1 \
-        || { task_fail; die "geodata更新失败 / geodata update failed"; }
-    task_done
-}
-
-# ---------------------------------------------------------------------------
-# 步骤4：配置 config.json / Configuring config.json
-# ---------------------------------------------------------------------------
-detect_ip() {
-    ip=$(curl -4s -m 3 https://api.ipify.org || true)
-    ip6=$(curl -6s -m 3 https://api64.ipify.org || true)
-    if [[ "$netstack" == "6" ]]; then
-        [[ -z "$ip6" ]] && die "未检测到公网IPv6 / No public IPv6 detected"
-        server_ip="$ip6"; url_ip="[$ip6]"
-    else
-        [[ -z "$ip" ]] && { [[ -n "$ip6" ]] && { server_ip="$ip6"; url_ip="[$ip6]"; } || die "未检测到公网IP / No public IP detected"; }
-        [[ -n "$ip" ]] && { server_ip="$ip"; url_ip="$ip"; }
+open_firewall() {
+    local port="$1"
+    if   command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q active; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
     fi
 }
 
-step_configure() {
-    task_start "快好了，手搓 / Configuring $CONFIG_PATH"
+# ── 低内存 Swap ───────────────────────────────────────────────
+setup_swap() {
+    local mem_mb; mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    if [[ $mem_mb -lt 256 ]] && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
+        info "内存仅 ${mem_mb}MB，创建 Swap / Low RAM, creating swap ..."
+        fallocate -l 512M /swapfile 2>/dev/null \
+            || dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
+        chmod 600 /swapfile
+        mkswap /swapfile -q
+        swapon /swapfile
+        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+}
 
-    [[ -z "$port" ]] && port=$(shuf -i 20000-60000 -n 1)
-    [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
+# ── 卸载 / Uninstall ─────────────────────────────────────────
+do_uninstall() {
+    banner
+    warn "开始卸载 / Uninstalling ..."
+    systemctl stop    xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
+        @ remove >/dev/null 2>&1 || true
+    rm -rf /usr/local/etc/xray /var/log/xray
+    ok "卸载完成 / Uninstall done"
+    exit 0
+}
 
-    keys=$(/usr/local/bin/xray x25519)
-    private_key=$(echo "$keys" | awk -F': ' '/Private/ {print $2}')
-    public_key=$(echo "$keys" | awk -F': ' '/Password|Public/ {print $2}')
-    short_id=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+# ── 步骤 1：工具链检查 / Tool check ───────────────────────────
+step_tool_check() {
+    info "工具链检查 / Tool check ..."
+    local need=()
+    for cmd in curl wget unzip; do
+        command -v "$cmd" &>/dev/null || need+=("$cmd")
+    done
+    [[ ${#need[@]} -gt 0 ]] && pkg_install "${need[@]}"
+    ok "工具链检查 / Tool check ... [OK]"
+}
 
-    mkdir -p "$(dirname "$CONFIG_PATH")"
-    cat > "$CONFIG_PATH" <<EOF
+# ── 步骤 2：安装 Xray / Install XRAY ─────────────────────────
+step_install_xray() {
+    info "开始，安装 XRAY / Install XRAY ..."
+    local attempt=0
+    while [[ $attempt -lt 3 ]]; do
+        if bash -c "$(curl -fsSL --retry 3 \
+            https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
+            @ install >/dev/null 2>&1; then
+            ok "开始，安装 XRAY / Install XRAY ... [OK]"
+            return 0
+        fi
+        (( attempt++ ))
+        warn "安装失败，重试 ${attempt}/3 / Retrying ..."
+        sleep 3
+    done
+    die "Xray 安装失败 / Xray install failed after 3 attempts"
+}
+
+# ── 步骤 3：更新 geodata ──────────────────────────────────────
+step_update_geodata() {
+    info "加速，更新 geodata / Updating geodata ..."
+    local geoDir="/usr/local/share/xray"
+    mkdir -p "$geoDir"
+    for f in geoip.dat geosite.dat; do
+        curl -fsSL --retry 3 \
+            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${f}" \
+            -o "${geoDir}/${f}" 2>/dev/null || true
+    done
+    ok "加速，更新 geodata / Updating geodata ... [OK]"
+}
+
+# ── 步骤 4：生成密钥对 ────────────────────────────────────────
+gen_reality_keys() {
+    local out; out=$(/usr/local/bin/xray x25519 2>/dev/null)
+    PRIVATE_KEY=$(echo "$out" | awk '/Private/{print $NF}')
+    PUBLIC_KEY=$(echo  "$out" | awk '/Public/{print $NF}')
+    SHORT_ID=$(openssl rand -hex 8 2>/dev/null \
+               || head -c4 /dev/urandom | xxd -p 2>/dev/null \
+               || tr -dc 'a-f0-9' </dev/urandom | head -c16)
+}
+
+# ── 步骤 4：写配置 / Config ───────────────────────────────────
+step_write_config() {
+    info "块好了，手搓 / Configuring /usr/local/etc/xray/config.json ..."
+
+    [[ -z "$UUID_CUSTOM" ]] && UUID_CUSTOM=$(gen_uuid)
+    [[ -z "$PORT"        ]] && PORT=$(gen_port)
+    gen_reality_keys
+
+    mkdir -p /usr/local/etc/xray /var/log/xray
+
+    cat > /usr/local/etc/xray/config.json <<JSON
 {
-  "log": { "loglevel": "warning" },
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error":  "/var/log/xray/error.log"
+  },
   "inbounds": [
     {
-      "port": ${port},
+      "listen": "0.0.0.0",
+      "port": ${PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
+        "clients": [
+          {
+            "id": "${UUID_CUSTOM}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
         "decryption": "none"
       },
       "streamSettings": {
@@ -145,104 +243,110 @@ step_configure() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "${sni}:443",
+          "dest": "${DOMAIN}:443",
           "xver": 0,
-          "serverNames": ["${sni}"],
-          "privateKey": "${private_key}",
-          "shortIds": ["${short_id}"]
+          "serverNames": ["${DOMAIN}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
-  ]
+    { "protocol": "freedom",  "tag": "direct"  },
+    { "protocol": "blackhole","tag": "blocked" }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "ip":     ["geoip:private"],           "outboundTag": "blocked" },
+      { "type": "field", "domain": ["geosite:category-ads-all"],"outboundTag": "blocked" }
+    ]
+  }
 }
-EOF
-    task_done
+JSON
+
+    ok "块好了，手搓 / Configuring /usr/local/etc/xray/config.json ... [OK]"
 }
 
-# ---------------------------------------------------------------------------
-# 步骤5：启动服务 / Starting Service
-# ---------------------------------------------------------------------------
+# ── 步骤 5：启动服务 / Start service ─────────────────────────
 step_start_service() {
-    task_start "冲刺，开启服务 / Starting Service"
-    systemctl restart "$SERVICE_NAME" >>"$LOG_FILE" 2>&1
-    systemctl enable "$SERVICE_NAME" >>"$LOG_FILE" 2>&1
-    task_done
+    info "冲刺，开启服务 / Starting Service ..."
+    systemctl daemon-reload
+    systemctl enable xray >/dev/null 2>&1
+    systemctl restart xray
+    sleep 1
+    ok "冲刺，开启服务 / Starting Service ... [OK]"
 }
 
-# ---------------------------------------------------------------------------
-# 步骤6：打开 BBR / Enabling BBR
-# ---------------------------------------------------------------------------
+# ── 步骤 6：BBR ───────────────────────────────────────────────
 step_enable_bbr() {
-    task_start "最后，打开BBR / Finishing, Enabling BBR"
-    if [[ -w /etc/sysctl.conf ]]; then
-        sed -i '/net.ipv4.tcp_congestion_control/d;/net.core.default_qdisc/d' /etc/sysctl.conf
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-        sysctl -p >>"$LOG_FILE" 2>&1 || true
+    info "最后，打开 BBR / Finishing, Enabling BBR ..."
+    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        {
+            echo 'net.core.default_qdisc=fq'
+            echo 'net.ipv4.tcp_congestion_control=bbr'
+        } >> /etc/sysctl.conf
+        sysctl -p >/dev/null 2>&1 || true
     fi
-    task_done
+    ok "最后，打开 BBR / Finishing, Enabling BBR ... [OK]"
 }
 
-# ---------------------------------------------------------------------------
-# 步骤7：检查服务状态 / Checking Service
-# ---------------------------------------------------------------------------
-step_check_status() {
-    task_start "检查服务状态 / Checking Service"
-    systemctl is-active --quiet "$SERVICE_NAME" || { task_fail; die "服务未运行，查看 $LOG_FILE / Service not running, see $LOG_FILE"; }
-    task_done
+# ── 步骤 7：放行防火墙 ────────────────────────────────────────
+step_firewall() {
+    open_firewall "$PORT"
 }
 
-# ---------------------------------------------------------------------------
-# 输出结果 / Done
-# ---------------------------------------------------------------------------
-step_output() {
-    detect_ip
-    link="vless://${uuid}@${url_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#$(hostname)"
+# ── 步骤 8：服务状态检查 ──────────────────────────────────────
+step_check_service() {
+    info "检查服务状态 / Checking Service ..."
+    systemctl is-active --quiet xray \
+        || die "Xray 未运行\n$(journalctl -u xray -n 20 --no-pager)"
+    ok "检查服务状态 / Checking Service ... [OK]"
+}
+
+# ── 输出结果 / Print result ───────────────────────────────────
+print_result() {
+    get_ip
+    local link="vless://${UUID_CUSTOM}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#REALITY-${SERVER_IP}"
 
     echo ""
-    echo "舒服了 / Done:"
+    echo -e "${GREEN}舒服了 / Done:${NC}"
     echo ""
-    echo -e "${magenta}${link}${none}"
+    echo -e "  ${PINK}${link}${NC}"
     echo ""
-    echo "总用时 / Elapsed Time:  ${green}${SECONDS} 秒${none}"
-    echo -e "---------- ${cyan}live free or die hard${none} -------------"
+    echo -e "  地址  / Address  :  ${YELLOW}${SERVER_IP}${NC}"
+    echo -e "  端口  / Port     :  ${YELLOW}${PORT}${NC}"
+    echo -e "  UUID             :  ${YELLOW}${UUID_CUSTOM}${NC}"
+    echo -e "  SNI              :  ${YELLOW}${DOMAIN}${NC}"
+    echo -e "  PublicKey        :  ${YELLOW}${PUBLIC_KEY}${NC}"
+    echo -e "  ShortID          :  ${YELLOW}${SHORT_ID}${NC}"
+    echo -e "  Flow             :  ${YELLOW}xtls-rprx-vision${NC}"
+    echo ""
+    echo -e "总用时 / Elapsed Time:  ${GREEN}$(elapsed) 秒${NC}"
+    echo -e "${CYAN}---------- live free or die hard ----------${NC}"
+    echo ""
 }
 
-dry_run_preview() {
-    echo "预览模式，不做任何更改 / Dry run — no changes will be made:"
-    echo "  1. 工具链检查 / Tool check"
-    echo "  2. 安装 XRAY / Install XRAY (${XRAY_INSTALL_URL})"
-    echo "  3. 更新 geodata / Update geodata"
-    echo "  4. 写入配置 / Write ${CONFIG_PATH} (port=${port:-random}, sni=${sni})"
-    echo "  5. 启动服务 / Start ${SERVICE_NAME}.service"
-    echo "  6. 启用 BBR / Enable BBR"
-    echo "  7. 检查状态 / Check service status"
-}
-
+# ── 主流程 / Main ─────────────────────────────────────────────
 main() {
-    SECONDS=0
+    require_root
     banner
-    parse_args "$@"
-    : > "$LOG_FILE"
-
-    if [[ $dry_run -eq 1 ]]; then
-        dry_run_preview
-        exit 0
-    fi
-
+    $UNINSTALL && do_uninstall
+    setup_swap
     step_tool_check
     step_install_xray
     step_update_geodata
-    step_configure
+    step_write_config
     step_start_service
     step_enable_bbr
-    step_check_status
-    step_output
+    step_firewall
+    step_check_service
+    print_result
 }
 
 main "$@"
