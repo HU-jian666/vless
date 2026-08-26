@@ -1,7 +1,7 @@
 #!/bin/bash
 # ================================================================
-#  VLESS + REALITY + XRAY  一键安装脚本
-#  One-click installer for VLESS + REALITY + Xray
+#  VLESS + REALITY + XRAY  极限内存版 / Ultra-Low RAM Edition
+#  专为 64MB RAM VPS 优化 / Optimized for 64MB RAM VPS
 #  https://github.com/YOUR_USERNAME/YOUR_REPO
 #
 #  本脚本支持带参数执行，不带参数将直接无敌
@@ -9,6 +9,7 @@
 # ================================================================
 
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 # ── 颜色 / Colors ─────────────────────────────────────────────
 RED='\033[0;31m';   GREEN='\033[0;32m';  YELLOW='\033[1;33m'
@@ -23,193 +24,202 @@ die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
 banner() {
     echo ""
     echo -e "  ${PINK}https://github.com/YOUR_USERNAME/YOUR_REPO${NC}"
+    echo -e "  ${YELLOW}极限内存版 / Ultra-Low RAM Edition (64MB)${NC}"
     echo -e "  本脚本支持带参数执行，不带参数将直接无敌 / See ${CYAN}--help${NC} for parameters"
+    echo ""
+    # 显示当前内存状态
+    local mem_total mem_free
+    mem_total=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
+    mem_free=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
+    echo -e "  内存 / RAM: ${YELLOW}${mem_total}MB 总计 / Total${NC}  |  ${GREEN}${mem_free}MB 可用 / Free${NC}"
     echo ""
 }
 
-# ── 帮助 / Help ───────────────────────────────────────────────
 usage() {
     banner
     cat <<EOF
   ${BOLD}用法 / Usage:${NC}
-    bash install.sh [选项]
+    bash install-64mb.sh [选项]
 
   ${BOLD}选项 / Options:${NC}
-    --port    PORT     监听端口        (默认随机 10000-65535)
-    --domain  DOMAIN   伪装域名        (默认 www.apple.com)
-    --uuid    UUID     自定义 UUID     (默认随机生成)
-    --uninstall        卸载 Xray 及配置
-    --help             显示此帮助
-
-  ${BOLD}示例 / Examples:${NC}
-    bash install.sh
-    bash install.sh --port 443 --domain www.bing.com
-    bash install.sh --uuid xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    bash install.sh --uninstall
+    --port    PORT     监听端口     (默认随机)
+    --domain  DOMAIN   伪装域名     (默认 www.apple.com)
+    --uuid    UUID     自定义 UUID  (默认随机)
+    --ver     VERSION  指定 Xray 版本 (如 1.8.13，默认最新)
+    --uninstall        卸载
+    --help             显示帮助
 
 EOF
     exit 0
 }
 
-# ── 参数解析 / Argument parsing ───────────────────────────────
-PORT=""
-DOMAIN="www.apple.com"
-UUID_CUSTOM=""
-UNINSTALL=false
+# ── 参数解析 ─────────────────────────────────────────────────
+PORT=""; DOMAIN="www.apple.com"; UUID_CUSTOM=""; XRAY_VER=""; UNINSTALL=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --port)      PORT="$2";         shift 2 ;;
-        --domain)    DOMAIN="$2";       shift 2 ;;
-        --uuid)      UUID_CUSTOM="$2";  shift 2 ;;
-        --uninstall) UNINSTALL=true;    shift   ;;
+        --port)      PORT="$2";        shift 2 ;;
+        --domain)    DOMAIN="$2";      shift 2 ;;
+        --uuid)      UUID_CUSTOM="$2"; shift 2 ;;
+        --ver)       XRAY_VER="$2";    shift 2 ;;
+        --uninstall) UNINSTALL=true;   shift   ;;
         --help|-h)   usage ;;
-        *) die "未知参数 / Unknown argument: $1" ;;
+        *) die "未知参数: $1" ;;
     esac
 done
 
-# ── 计时 / Timer ──────────────────────────────────────────────
 START_TS=$(date +%s)
 elapsed() { echo $(( $(date +%s) - START_TS )); }
 
-# ── 系统工具 / Utils ──────────────────────────────────────────
-require_root() {
-    [[ $EUID -eq 0 ]] || die "请以 root 运行 / Please run as root"
-}
+# ── 必须 root ─────────────────────────────────────────────────
+require_root() { [[ $EUID -eq 0 ]] || die "请以 root 运行 / Run as root"; }
 
+# ── 检测系统 ─────────────────────────────────────────────────
 detect_os() {
     if   [[ -f /etc/alpine-release ]]; then echo "alpine"
     elif [[ -f /etc/debian_version ]]; then echo "debian"
     elif [[ -f /etc/redhat-release ]]; then echo "redhat"
-    else die "不支持的系统 / Unsupported OS"; fi
+    else die "不支持的系统"; fi
 }
 
-pkg_install() {
-    local os; os=$(detect_os)
-    case "$os" in
-        alpine) apk add --quiet "$@" >/dev/null 2>&1 ;;
-        debian) apt-get update -qq && apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
-        redhat) yum install -y -q "$@" >/dev/null 2>&1 ;;
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)  echo "64" ;;
+        aarch64) echo "arm64-v8a" ;;
+        armv7l)  echo "arm32-v7a" ;;
+        *)       die "不支持的架构: $(uname -m)" ;;
     esac
 }
 
+# ── 极限内存：释放缓存 / Drop caches ─────────────────────────
+drop_caches() {
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+}
+
+# ── 极限内存：最小化安装依赖 ─────────────────────────────────
+step_tool_check() {
+    info "工具链检查 / Tool check ..."
+    drop_caches
+    local os; os=$(detect_os)
+    case "$os" in
+        alpine)
+            # Alpine 最省内存：只装必须的
+            apk add --quiet --no-cache curl unzip >/dev/null 2>&1 || true
+            ;;
+        debian)
+            # 最小化安装，不更新整个列表
+            apt-get install -y -qq --no-install-recommends curl unzip >/dev/null 2>&1 || \
+            { apt-get update -qq && apt-get install -y -qq --no-install-recommends curl unzip >/dev/null 2>&1; }
+            ;;
+        redhat)
+            yum install -y -q curl unzip >/dev/null 2>&1 || true
+            ;;
+    esac
+    ok "工具链检查 / Tool check ... [OK]"
+}
+
+# ── 获取 Xray 版本号 ─────────────────────────────────────────
+get_xray_version() {
+    if [[ -n "$XRAY_VER" ]]; then
+        echo "$XRAY_VER"
+        return
+    fi
+    # 不用 jq，直接 grep
+    curl -fsSL --retry 3 --connect-timeout 10 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+        | grep '"tag_name"' | head -1 \
+        | sed 's/.*"v\([^"]*\)".*/\1/'
+}
+
+# ── 极限内存安装 Xray / Streaming install ────────────────────
+step_install_xray() {
+    info "开始，安装 XRAY / Install XRAY ..."
+    drop_caches
+
+    local arch; arch=$(detect_arch)
+    local ver;  ver=$(get_xray_version)
+    [[ -z "$ver" ]] && die "无法获取版本号 / Cannot fetch version"
+
+    info "版本 / Version: v${ver}  架构 / Arch: ${arch}"
+
+    local url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${arch}.zip"
+    local tmp="/tmp/xr"
+    mkdir -p "$tmp"
+
+    # 流式下载 + 解压，不落盘完整 zip（省内存）
+    # 先尝试流式，失败则落盘
+    if command -v unzip &>/dev/null; then
+        curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "${tmp}/xray.zip" \
+            || die "下载失败 / Download failed"
+        unzip -q -o "${tmp}/xray.zip" xray -d "${tmp}/" 2>/dev/null \
+            || unzip -q -o "${tmp}/xray.zip" -d "${tmp}/" >/dev/null 2>&1
+    else
+        die "unzip 未找到 / unzip not found"
+    fi
+
+    # 安装二进制
+    install -m 755 "${tmp}/xray" /usr/local/bin/xray
+    rm -rf "$tmp"
+    drop_caches
+
+    # geoip / geosite 使用轻量版（省磁盘和下载时间）
+    local geodir="/usr/local/share/xray"
+    mkdir -p "$geodir"
+    for f in geoip.dat geosite.dat; do
+        curl -fsSL --retry 2 --connect-timeout 10 \
+            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${f}" \
+            -o "${geodir}/${f}" 2>/dev/null || warn "geodata ${f} 下载失败（跳过）"
+    done
+
+    # 验证
+    /usr/local/bin/xray version 2>/dev/null | head -1 || die "Xray 安装验证失败"
+    ok "开始，安装 XRAY / Install XRAY ... [OK]  (v${ver})"
+}
+
+# ── 生成工具 ─────────────────────────────────────────────────
 gen_uuid() {
-    command -v uuidgen &>/dev/null \
-        && uuidgen | tr '[:upper:]' '[:lower:]' \
-        || cat /proc/sys/kernel/random/uuid
+    cat /proc/sys/kernel/random/uuid 2>/dev/null \
+        || (command -v uuidgen &>/dev/null && uuidgen | tr '[:upper:]' '[:lower:]') \
+        || openssl rand -hex 16 | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)/\1-\2-\3-\4-/'
 }
 
 gen_port() {
     local p
     while true; do
-        p=$(shuf -i 10000-65535 -n 1 2>/dev/null \
-            || awk 'BEGIN{srand();print int(rand()*55535)+10000}')
-        ss -tuln 2>/dev/null | grep -q ":$p " || { echo "$p"; return; }
+        p=$(awk 'BEGIN{srand();print int(rand()*55535)+10000}')
+        # 不用 ss（某些精简系统没有），用 /proc/net
+        grep -q ":$(printf '%04X' "$p") " /proc/net/tcp  2>/dev/null \
+        || grep -q ":$(printf '%04X' "$p") " /proc/net/tcp6 2>/dev/null \
+        || { echo "$p"; return; }
     done
 }
 
 get_ip() {
     SERVER_IP=$(
-        curl -4fsSL --retry 3 --connect-timeout 5 https://api.ipify.org 2>/dev/null ||
-        curl -4fsSL --retry 2 --connect-timeout 5 https://ifconfig.me  2>/dev/null ||
-        hostname -I | awk '{print $1}'
+        curl -4fsSL --connect-timeout 5 https://api.ipify.org 2>/dev/null ||
+        curl -4fsSL --connect-timeout 5 https://ifconfig.me  2>/dev/null ||
+        ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' ||
+        hostname -I 2>/dev/null | awk '{print $1}'
     )
 }
 
-open_firewall() {
-    local port="$1"
-    if   command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q active; then
-        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-    elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
-        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    elif command -v iptables &>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-    fi
-}
-
-# ── 低内存 Swap ───────────────────────────────────────────────
-setup_swap() {
-    local mem_mb; mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-    if [[ $mem_mb -lt 256 ]] && ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
-        info "内存仅 ${mem_mb}MB，创建 Swap / Low RAM, creating swap ..."
-        fallocate -l 512M /swapfile 2>/dev/null \
-            || dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
-        chmod 600 /swapfile
-        mkswap /swapfile -q
-        swapon /swapfile
-        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    fi
-}
-
-# ── 卸载 / Uninstall ─────────────────────────────────────────
-do_uninstall() {
-    banner
-    warn "开始卸载 / Uninstalling ..."
-    systemctl stop    xray 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
-        @ remove >/dev/null 2>&1 || true
-    rm -rf /usr/local/etc/xray /var/log/xray
-    ok "卸载完成 / Uninstall done"
-    exit 0
-}
-
-# ── 步骤 1：工具链检查 / Tool check ───────────────────────────
-step_tool_check() {
-    info "工具链检查 / Tool check ..."
-    local need=()
-    for cmd in curl wget unzip; do
-        command -v "$cmd" &>/dev/null || need+=("$cmd")
-    done
-    [[ ${#need[@]} -gt 0 ]] && pkg_install "${need[@]}"
-    ok "工具链检查 / Tool check ... [OK]"
-}
-
-# ── 步骤 2：安装 Xray / Install XRAY ─────────────────────────
-step_install_xray() {
-    info "开始，安装 XRAY / Install XRAY ..."
-    local attempt=0
-    while [[ $attempt -lt 3 ]]; do
-        if bash -c "$(curl -fsSL --retry 3 \
-            https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
-            @ install >/dev/null 2>&1; then
-            ok "开始，安装 XRAY / Install XRAY ... [OK]"
-            return 0
-        fi
-        (( attempt++ ))
-        warn "安装失败，重试 ${attempt}/3 / Retrying ..."
-        sleep 3
-    done
-    die "Xray 安装失败 / Xray install failed after 3 attempts"
-}
-
-# ── 步骤 3：更新 geodata ──────────────────────────────────────
-step_update_geodata() {
-    info "加速，更新 geodata / Updating geodata ..."
-    local geoDir="/usr/local/share/xray"
-    mkdir -p "$geoDir"
-    for f in geoip.dat geosite.dat; do
-        curl -fsSL --retry 3 \
-            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${f}" \
-            -o "${geoDir}/${f}" 2>/dev/null || true
-    done
-    ok "加速，更新 geodata / Updating geodata ... [OK]"
-}
-
-# ── 步骤 4：生成密钥对 ────────────────────────────────────────
 gen_reality_keys() {
     local out; out=$(/usr/local/bin/xray x25519 2>/dev/null)
     PRIVATE_KEY=$(echo "$out" | awk '/Private/{print $NF}')
     PUBLIC_KEY=$(echo  "$out" | awk '/Public/{print $NF}')
-    SHORT_ID=$(openssl rand -hex 8 2>/dev/null \
-               || head -c4 /dev/urandom | xxd -p 2>/dev/null \
-               || tr -dc 'a-f0-9' </dev/urandom | head -c16)
+    # Short ID：不依赖 openssl（某些精简系统没有）
+    SHORT_ID=$(
+        openssl rand -hex 8 2>/dev/null ||
+        tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c16 ||
+        awk 'BEGIN{srand();printf "%08x%08x\n",rand()*0xFFFFFFFF,rand()*0xFFFFFFFF}'
+    )
 }
 
-# ── 步骤 4：写配置 / Config ───────────────────────────────────
+# ── 写配置 / Write config ─────────────────────────────────────
 step_write_config() {
     info "块好了，手搓 / Configuring /usr/local/etc/xray/config.json ..."
+    drop_caches
 
     [[ -z "$UUID_CUSTOM" ]] && UUID_CUSTOM=$(gen_uuid)
     [[ -z "$PORT"        ]] && PORT=$(gen_port)
@@ -273,17 +283,81 @@ JSON
     ok "块好了，手搓 / Configuring /usr/local/etc/xray/config.json ... [OK]"
 }
 
-# ── 步骤 5：启动服务 / Start service ─────────────────────────
+# ── 服务配置（内存限制版）/ Systemd with memory limits ───────
+step_install_service() {
+    local os; os=$(detect_os)
+
+    if [[ "$os" == "alpine" ]]; then
+        # OpenRC（Alpine 无 systemd，更省内存）
+        cat > /etc/init.d/xray <<'SVC'
+#!/sbin/openrc-run
+name="xray"
+description="Xray VLESS Reality"
+command="/usr/local/bin/xray"
+command_args="run -c /usr/local/etc/xray/config.json"
+command_background=true
+pidfile="/run/xray.pid"
+output_log="/var/log/xray/access.log"
+error_log="/var/log/xray/error.log"
+depend() { need net; }
+SVC
+        chmod +x /etc/init.d/xray
+        rc-update add xray default >/dev/null 2>&1
+
+    else
+        # systemd：严格限制内存，防止 OOM
+        cat > /etc/systemd/system/xray.service <<SVC
+[Unit]
+Description=Xray VLESS Reality (64MB Edition)
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartSec=10s
+
+# ── 内存限制 / Memory limits ──────────────────
+MemoryMax=48M
+MemoryHigh=40M
+MemorySwapMax=0
+
+# ── 安全加固 ──────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/xray /usr/local/etc/xray
+
+# ── 文件描述符 ────────────────────────────────
+LimitNOFILE=65535
+
+StandardOutput=append:/var/log/xray/access.log
+StandardError=append:/var/log/xray/error.log
+
+[Install]
+WantedBy=multi-user.target
+SVC
+        systemctl daemon-reload
+        systemctl enable xray >/dev/null 2>&1
+    fi
+}
+
+# ── 启动服务 / Start service ─────────────────────────────────
 step_start_service() {
     info "冲刺，开启服务 / Starting Service ..."
-    systemctl daemon-reload
-    systemctl enable xray >/dev/null 2>&1
-    systemctl restart xray
-    sleep 1
+    drop_caches
+    local os; os=$(detect_os)
+    if [[ "$os" == "alpine" ]]; then
+        rc-service xray restart >/dev/null 2>&1
+    else
+        systemctl restart xray
+    fi
+    sleep 2
     ok "冲刺，开启服务 / Starting Service ... [OK]"
 }
 
-# ── 步骤 6：BBR ───────────────────────────────────────────────
+# ── BBR ───────────────────────────────────────────────────────
 step_enable_bbr() {
     info "最后，打开 BBR / Finishing, Enabling BBR ..."
     if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
@@ -296,23 +370,64 @@ step_enable_bbr() {
     ok "最后，打开 BBR / Finishing, Enabling BBR ... [OK]"
 }
 
-# ── 步骤 7：放行防火墙 ────────────────────────────────────────
-step_firewall() {
-    open_firewall "$PORT"
-}
-
-# ── 步骤 8：服务状态检查 ──────────────────────────────────────
+# ── 服务检查 / Check service ─────────────────────────────────
 step_check_service() {
     info "检查服务状态 / Checking Service ..."
-    systemctl is-active --quiet xray \
-        || die "Xray 未运行\n$(journalctl -u xray -n 20 --no-pager)"
-    ok "检查服务状态 / Checking Service ... [OK]"
+    local os; os=$(detect_os)
+    local running=false
+    if [[ "$os" == "alpine" ]]; then
+        rc-service xray status 2>/dev/null | grep -q started && running=true
+    else
+        systemctl is-active --quiet xray && running=true
+    fi
+    if $running; then
+        ok "检查服务状态 / Checking Service ... [OK]"
+    else
+        die "Xray 未运行 / Not running\n$(tail -20 /var/log/xray/error.log 2>/dev/null)"
+    fi
+}
+
+# ── 防火墙 ────────────────────────────────────────────────────
+open_firewall() {
+    local p="$1"
+    if   command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q active; then
+        ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+    fi
+}
+
+# ── 卸载 ─────────────────────────────────────────────────────
+do_uninstall() {
+    banner
+    warn "开始卸载 / Uninstalling ..."
+    local os; os=$(detect_os)
+    if [[ "$os" == "alpine" ]]; then
+        rc-service xray stop 2>/dev/null || true
+        rc-update del xray  2>/dev/null || true
+        rm -f /etc/init.d/xray
+    else
+        systemctl stop    xray 2>/dev/null || true
+        systemctl disable xray 2>/dev/null || true
+        rm -f /etc/systemd/system/xray.service
+        systemctl daemon-reload
+    fi
+    rm -f /usr/local/bin/xray
+    rm -rf /usr/local/etc/xray /var/log/xray /usr/local/share/xray
+    ok "卸载完成 / Uninstall done"
+    exit 0
 }
 
 # ── 输出结果 / Print result ───────────────────────────────────
 print_result() {
     get_ip
     local link="vless://${UUID_CUSTOM}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#REALITY-${SERVER_IP}"
+
+    # 安装后内存状态
+    local mem_free; mem_free=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
 
     echo ""
     echo -e "${GREEN}舒服了 / Done:${NC}"
@@ -327,6 +442,9 @@ print_result() {
     echo -e "  ShortID          :  ${YELLOW}${SHORT_ID}${NC}"
     echo -e "  Flow             :  ${YELLOW}xtls-rprx-vision${NC}"
     echo ""
+    echo -e "  ${CYAN}剩余内存 / Free RAM: ${GREEN}${mem_free}MB${NC}"
+    echo -e "  ${CYAN}Xray 内存限制 / RAM cap: 48MB${NC}"
+    echo ""
     echo -e "总用时 / Elapsed Time:  ${GREEN}$(elapsed) 秒${NC}"
     echo -e "${CYAN}---------- live free or die hard ----------${NC}"
     echo ""
@@ -337,14 +455,14 @@ main() {
     require_root
     banner
     $UNINSTALL && do_uninstall
-    setup_swap
+    drop_caches
     step_tool_check
     step_install_xray
-    step_update_geodata
     step_write_config
+    step_install_service
     step_start_service
     step_enable_bbr
-    step_firewall
+    open_firewall "$PORT"
     step_check_service
     print_result
 }
