@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
 # ============================================================
-# Xray VLESS + REALITY 一键安装脚本
-# 64MB 超低内存 / 随机端口 / 全自动
-#
-# Usage:
-#   bash install.sh
-#   bash install.sh --domain www.apple.com
+# Xray VLESS + REALITY 一键安装
+# LOW MEMORY / RANDOM PORT / FULL AUTO
 # ============================================================
 
 set -Eeuo pipefail
+
+START_TIME="$(date +%s)"
 
 # ============================================================
 # 基础变量
 # ============================================================
 
-START_TIME="$(date +%s)"
+DOMAIN="www.apple.com"
 
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_INFO="/root/xray-info.txt"
-XRAY_INSTALL="/tmp/xray-install.sh"
-
-DOMAIN="www.apple.com"
 
 PORT=""
 UUID=""
@@ -30,10 +25,6 @@ PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
 SERVER_IP=""
-ARCH=""
-OS_ID=""
-MEM_MB=""
-BBR_STATUS="unknown"
 
 # ============================================================
 # 颜色
@@ -57,65 +48,18 @@ msg() {
     echo -e "$*"
 }
 
-step() {
-    msg "$1"
-}
-
 die() {
     msg "${FAIL} $1"
     exit 1
 }
 
 # ============================================================
-# 错误处理
-# ============================================================
-
-trap '
-echo
-msg "${FAIL} 安装失败"
-msg "错误行号: ${LINENO}"
-exit 1
-' ERR
-
-# ============================================================
-# 参数
-# ============================================================
-
-while [[ $# -gt 0 ]]; do
-
-    case "$1" in
-
-        --domain)
-            DOMAIN="${2:-}"
-            shift 2
-            ;;
-
-        --help|-h)
-            echo
-            echo "VLESS + REALITY 64MB 自动安装"
-            echo
-            echo "用法:"
-            echo
-            echo "bash install.sh"
-            echo
-            echo "bash install.sh --domain www.apple.com"
-            echo
-            exit 0
-            ;;
-
-        *)
-            die "未知参数: $1"
-            ;;
-
-    esac
-
-done
-
-# ============================================================
 # Root
 # ============================================================
 
-[[ "${EUID}" -eq 0 ]] || die "请使用 root 用户运行"
+if [[ "${EUID}" -ne 0 ]]; then
+    die "请使用 root 用户运行"
+fi
 
 # ============================================================
 # Banner
@@ -125,8 +69,8 @@ clear 2>/dev/null || true
 
 echo
 echo "============================================================"
-echo "      VLESS + REALITY / XRAY / LOW MEMORY"
-echo "      64MB / RANDOM PORT / FULL AUTO"
+echo "        VLESS + REALITY / XRAY / LOW MEMORY"
+echo "        RANDOM PORT / FULL AUTO"
 echo "============================================================"
 echo
 
@@ -134,7 +78,7 @@ echo
 # 内存检测
 # ============================================================
 
-step "内存检测 / Checking Memory ..."
+msg "内存检测 / Checking Memory ..."
 
 MEM_MB="$(
     awk '/MemTotal/ {
@@ -143,20 +87,16 @@ MEM_MB="$(
 )"
 
 if [[ -z "${MEM_MB}" ]]; then
-    die "无法检测服务器内存"
+    die "无法读取内存"
 fi
 
-if (( MEM_MB <= 80 )); then
-    msg "${OK} ${MEM_MB} MB / Low Memory Mode"
-else
-    msg "${OK} ${MEM_MB} MB"
-fi
+msg "${OK} ${MEM_MB} MB"
 
 # ============================================================
 # 架构检测
 # ============================================================
 
-step "架构检测 / Detecting Architecture ..."
+msg "架构检测 / Detecting Architecture ..."
 
 case "$(uname -m)" in
 
@@ -173,7 +113,7 @@ case "$(uname -m)" in
         ;;
 
     *)
-        die "不支持的 CPU 架构: $(uname -m)"
+        die "不支持的架构: $(uname -m)"
         ;;
 
 esac
@@ -184,30 +124,33 @@ msg "${OK} ${ARCH}"
 # 系统检测
 # ============================================================
 
-step "系统检测 / Detecting OS ..."
+msg "系统检测 / Detecting OS ..."
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
-    OS_ID="${ID:-unknown}"
 else
-    OS_ID="unknown"
+    die "无法识别系统"
 fi
+
+OS_ID="${ID:-unknown}"
 
 msg "${OK} ${OS_ID}"
 
 # ============================================================
-# 安装基础工具
+# 工具链
 # ============================================================
 
-step "工具链检查 / Tool Check ..."
+msg "工具链检查 / Tool Check ..."
 
 export DEBIAN_FRONTEND=noninteractive
 
 case "${OS_ID}" in
 
-    ubuntu|debian)
+    debian|ubuntu)
 
-        apt-get update -y >/dev/null 2>&1 || true
+        apt-get update -y \
+            >/dev/null 2>&1 \
+            || true
 
         apt-get install -y \
             curl \
@@ -233,13 +176,14 @@ case "${OS_ID}" in
             openssl \
             iproute \
             procps \
-            >/dev/null 2>&1 || true
+            >/dev/null 2>&1 \
+            || true
 
         ;;
 
     *)
 
-        msg "${WARN} 未识别发行版，继续尝试"
+        msg "${WARN} 未识别系统，继续尝试"
 
         ;;
 
@@ -248,83 +192,67 @@ esac
 msg "${OK}"
 
 # ============================================================
-# systemd
+# 随机端口
 # ============================================================
 
-command -v systemctl >/dev/null 2>&1 \
-    || die "当前系统没有 systemd"
+msg "随机生成端口 / Generating Random Port ..."
 
-# ============================================================
-# 检查端口占用
-# ============================================================
+port_used() {
 
-port_in_use() {
-
-    local p="$1"
+    local P="$1"
 
     if command -v ss >/dev/null 2>&1; then
 
         ss -H -lnt 2>/dev/null |
-            awk '{print $4}' |
-            grep -qE "[:.]${p}$"
+        awk '{print $4}' |
+        grep -qE "([.:])${P}$"
 
     else
+
         return 1
+
     fi
 }
 
-# ============================================================
-# 随机生成端口
-# ============================================================
-
-step "随机生成端口 / Generating Random Port ..."
-
-PORT=""
-
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
 
     if command -v shuf >/dev/null 2>&1; then
 
-        CANDIDATE="$(
+        TEST_PORT="$(
             shuf -i 10000-60000 -n 1
         )"
 
     else
 
-        CANDIDATE="$(
+        TEST_PORT="$(
             awk 'BEGIN {
                 srand();
-                print int(10000 + rand()*50001)
+                print int(10000+rand()*50001)
             }'
         )"
 
     fi
 
-    case "${CANDIDATE}" in
-        10000|20000|30000|40000|50000)
-            continue
-            ;;
-    esac
-
-    if ! port_in_use "${CANDIDATE}"; then
-        PORT="${CANDIDATE}"
+    if ! port_used "${TEST_PORT}"; then
+        PORT="${TEST_PORT}"
         break
     fi
 
 done
 
-[[ -n "${PORT}" ]] \
-    || die "无法生成可用随机端口"
+[[ -n "${PORT}" ]] || die "无法生成随机端口"
 
 msg "${OK} Random Port: ${PORT}"
 
 # ============================================================
-# 停止旧 Xray
+# 停止旧服务
 # ============================================================
 
-step "检查旧服务 / Checking Existing Xray ..."
+msg "检查旧服务 / Checking Existing Xray ..."
 
-systemctl stop xray.service >/dev/null 2>&1 || true
+systemctl stop xray.service \
+    >/dev/null 2>&1 \
+    || true
 
 msg "${OK}"
 
@@ -332,25 +260,21 @@ msg "${OK}"
 # 安装 Xray
 # ============================================================
 
-step "开始，安装 XRAY / Installing XRAY ..."
+msg "开始，安装 XRAY / Installing XRAY ..."
 
-curl -fsSL \
-    https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-    -o "${XRAY_INSTALL}"
-
-chmod +x "${XRAY_INSTALL}"
-
-bash "${XRAY_INSTALL}" @ install --without-geodata \
+# 使用 Xray 官方推荐方式
+bash -c "$(
+    curl -fsSL \
+    https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+)" @ install --without-geodata \
     >/tmp/xray-install.log 2>&1 \
     || {
         cat /tmp/xray-install.log
         die "Xray 安装失败"
     }
 
-rm -f "${XRAY_INSTALL}"
-
 [[ -x "${XRAY_BIN}" ]] \
-    || die "Xray 安装成功但没有找到二进制文件"
+    || die "Xray 二进制文件不存在"
 
 msg "${OK}"
 
@@ -366,14 +290,13 @@ chmod 755 "${XRAY_DIR}"
 # UUID
 # ============================================================
 
-step "生成 UUID / Generating UUID ..."
+msg "生成 UUID / Generating UUID ..."
 
 UUID="$(
     cat /proc/sys/kernel/random/uuid
 )"
 
-[[ -n "${UUID}" ]] \
-    || die "UUID 生成失败"
+[[ -n "${UUID}" ]] || die "UUID 生成失败"
 
 msg "${OK}"
 
@@ -381,29 +304,27 @@ msg "${OK}"
 # Reality Key
 # ============================================================
 
-step "生成 Reality Key / Generating Reality Key ..."
+msg "生成 Reality Key / Generating Reality Key ..."
 
 KEY_OUTPUT="$(
     "${XRAY_BIN}" x25519 2>/dev/null
 )"
 
 PRIVATE_KEY="$(
-    echo "${KEY_OUTPUT}" |
+    printf '%s\n' "${KEY_OUTPUT}" |
     sed -n 's/^Private key: //p' |
-    head -n1
+    head -n 1
 )"
 
 PUBLIC_KEY="$(
-    echo "${KEY_OUTPUT}" |
+    printf '%s\n' "${KEY_OUTPUT}" |
     sed -n 's/^Public key: //p' |
-    head -n1
+    head -n 1
 )"
 
-[[ -n "${PRIVATE_KEY}" ]] \
-    || die "Private Key 生成失败"
+[[ -n "${PRIVATE_KEY}" ]] || die "Private Key 生成失败"
 
-[[ -n "${PUBLIC_KEY}" ]] \
-    || die "Public Key 生成失败"
+[[ -n "${PUBLIC_KEY}" ]] || die "Public Key 生成失败"
 
 msg "${OK}"
 
@@ -411,41 +332,40 @@ msg "${OK}"
 # Short ID
 # ============================================================
 
-step "生成 Short ID / Generating Short ID ..."
+msg "生成 Short ID / Generating Short ID ..."
 
 SHORT_ID="$(
     openssl rand -hex 8
 )"
 
-[[ -n "${SHORT_ID}" ]] \
-    || die "Short ID 生成失败"
+[[ -n "${SHORT_ID}" ]] || die "Short ID 生成失败"
 
 msg "${OK}"
 
 # ============================================================
-# 获取公网 IP
+# 公网 IP
 # ============================================================
 
-step "检测公网 IP / Detecting Public IP ..."
+msg "检测公网 IP / Detecting Public IP ..."
 
 SERVER_IP="$(
     curl -4fsSL \
-        --connect-timeout 3 \
-        --max-time 5 \
-        https://api.ipify.org \
-        2>/dev/null \
-        || true
+    --connect-timeout 3 \
+    --max-time 5 \
+    https://api.ipify.org \
+    2>/dev/null \
+    || true
 )"
 
 if [[ -z "${SERVER_IP}" ]]; then
 
     SERVER_IP="$(
         curl -4fsSL \
-            --connect-timeout 3 \
-            --max-time 5 \
-            https://ifconfig.me \
-            2>/dev/null \
-            || true
+        --connect-timeout 3 \
+        --max-time 5 \
+        https://ifconfig.me \
+        2>/dev/null \
+        || true
     )"
 
 fi
@@ -468,7 +388,7 @@ msg "${OK} ${SERVER_IP}"
 # 配置 Xray
 # ============================================================
 
-step "快速配置，手搓 / Configuring ${XRAY_CONFIG} ..."
+msg "快速配置，手搓 / Configuring ${XRAY_CONFIG} ..."
 
 cat > "${XRAY_CONFIG}" <<EOF
 {
@@ -537,10 +457,10 @@ chmod 600 "${XRAY_CONFIG}"
 msg "${OK}"
 
 # ============================================================
-# 检查 Xray 配置
+# 检查配置
 # ============================================================
 
-step "配置检查 / Checking Config ..."
+msg "配置检查 / Checking Config ..."
 
 "${XRAY_BIN}" run \
     -test \
@@ -554,31 +474,21 @@ step "配置检查 / Checking Config ..."
 msg "${OK}"
 
 # ============================================================
-# 低内存 Systemd
+# systemd 低内存优化
 # ============================================================
 
-step "低内存优化 / Optimizing Memory ..."
+msg "低内存优化 / Optimizing Memory ..."
 
 mkdir -p /etc/systemd/system/xray.service.d
 
 cat > /etc/systemd/system/xray.service.d/override.conf <<EOF
 [Service]
-
-# 限制 Xray 内存
 MemoryHigh=40M
 MemoryMax=48M
-
-# 自动重启
 Restart=always
 RestartSec=2
-
-# 限制文件句柄
 LimitNOFILE=65535
-
-# 禁止生成 core
 LimitCORE=0
-
-# 降低被 OOM 优先杀死概率
 OOMScoreAdjust=-500
 EOF
 
@@ -590,32 +500,32 @@ msg "${OK}"
 # BBR
 # ============================================================
 
-step "最后，打开 BBR / Finishing, Enabling BBR ..."
+msg "最后，打开 BBR / Finishing, Enabling BBR ..."
 
 if command -v sysctl >/dev/null 2>&1; then
 
-    modprobe tcp_bbr >/dev/null 2>&1 || true
+    modprobe tcp_bbr \
+        >/dev/null 2>&1 \
+        || true
 
     sysctl -w \
         net.core.default_qdisc=fq \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1 \
+        || true
 
     sysctl -w \
         net.ipv4.tcp_congestion_control=bbr \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1 \
+        || true
 
 fi
 
-if command -v sysctl >/dev/null 2>&1; then
-
-    BBR_STATUS="$(
-        sysctl -n \
-        net.ipv4.tcp_congestion_control \
-        2>/dev/null \
-        || echo "unknown"
-    )"
-
-fi
+BBR_STATUS="$(
+    sysctl -n \
+    net.ipv4.tcp_congestion_control \
+    2>/dev/null \
+    || echo "unknown"
+)"
 
 msg "${OK}"
 
@@ -623,7 +533,7 @@ msg "${OK}"
 # 防火墙
 # ============================================================
 
-step "放行随机端口 / Opening Random Port ..."
+msg "放行随机端口 / Opening Random Port ..."
 
 if command -v ufw >/dev/null 2>&1; then
 
@@ -651,10 +561,10 @@ fi
 msg "${OK}"
 
 # ============================================================
-# 启动 Xray
+# 启动服务
 # ============================================================
 
-step "启动服务 / Starting Service ..."
+msg "启动服务 / Starting Service ..."
 
 systemctl enable xray.service \
     >/dev/null 2>&1 \
@@ -667,10 +577,10 @@ sleep 2
 msg "${OK}"
 
 # ============================================================
-# 检查服务
+# 检查服务状态
 # ============================================================
 
-step "检查服务状态 / Checking Service ..."
+msg "检查服务状态 / Checking Service ..."
 
 if systemctl is-active --quiet xray.service; then
 
@@ -679,6 +589,7 @@ if systemctl is-active --quiet xray.service; then
 else
 
     echo
+
     journalctl \
         -u xray.service \
         --no-pager \
@@ -690,19 +601,20 @@ else
 fi
 
 # ============================================================
-# 检测监听
+# 检查端口
 # ============================================================
 
 if command -v ss >/dev/null 2>&1; then
 
     if ss -lnt 2>/dev/null |
-        grep -qE ":${PORT}[[:space:]]"; then
+       grep -qE ":${PORT}[[:space:]]"; then
 
         msg "${OK} Listening: ${PORT}"
 
     else
 
-        msg "${WARN} 未检测到端口监听"
+        msg "${WARN} 未检测到 ${PORT} 监听"
+
     fi
 
 fi
@@ -714,7 +626,7 @@ fi
 VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Xray-Reality"
 
 # ============================================================
-# 保存信息
+# 保存配置
 # ============================================================
 
 cat > "${XRAY_INFO}" <<EOF
@@ -722,7 +634,7 @@ cat > "${XRAY_INFO}" <<EOF
 Xray VLESS REALITY
 ============================================================
 
-Server IP:
+IP:
 ${SERVER_IP}
 
 Port:
@@ -758,17 +670,15 @@ EOF
 chmod 600 "${XRAY_INFO}"
 
 # ============================================================
-# 最终时间
+# 时间
 # ============================================================
 
 END_TIME="$(date +%s)"
 
-ELAPSED="$(
-    (( END_TIME - START_TIME )) || true
-)"
+ELAPSED=$((END_TIME - START_TIME))
 
 # ============================================================
-# 最终输出
+# Done
 # ============================================================
 
 echo
