@@ -44,6 +44,13 @@ EOF
   exit 0
 }
 
+# 有些终端/输入法/剪贴板工具会把裸域名自动转成 markdown 链接
+# [www.x.com](https://www.x.com)，导致写进 config.json 后 REALITY 握手失败。
+# 这里统一净化：命中该模式就取方括号内的纯文本，其余不变。
+strip_md_link() {
+  echo "$1" | sed -E 's/\[([^]]+)\]\([^)]*\)/\1/g'
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
@@ -56,6 +63,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "请以 root 运行 / must run as root"
+
+SNI=$(strip_md_link "$SNI")
 
 # ---------- 1. tool check ----------
 step "工具链检查 / Tool check"
@@ -114,6 +123,12 @@ cat > /usr/local/etc/xray/config.json <<EOF
 }
 EOF
 ok
+
+# ---------- 4b. sanitize config.json against markdown-link corruption ----------
+if grep -qE '\[[^]]+\]\([^)]*\)' /usr/local/etc/xray/config.json; then
+  echo -e "${C_Y}[WARN]${C_N} 检测到 config.json 被污染成 markdown 链接格式（多半是粘贴通道自动转链接导致），已自动修复"
+  sed -i -E 's/\[([^]]+)\]\([^)]*\)/\1/g' /usr/local/etc/xray/config.json
+fi
 
 # ---------- 5. start service ----------
 step "冲刺，开启服务 / Starting Service"
