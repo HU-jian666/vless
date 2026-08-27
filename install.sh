@@ -17,7 +17,14 @@ rand_port() {
   local p
   while :; do
     p=$(( (RANDOM << 4 | RANDOM) % 55536 + 10000 ))   # 10000-65535
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$" || { echo "$p"; return; }
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$" && continue
+    elif command -v netstat >/dev/null 2>&1; then
+      netstat -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$" && continue
+    else
+      (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null && { exec 3>&-; continue; }
+    fi
+    echo "$p"; return
   done
 }
 PORT=$(rand_port)
@@ -73,8 +80,9 @@ ok
 step "快好了，手搓 / Configuring /usr/local/etc/xray/config.json"
 [[ -z "$UUID" ]] && UUID=$(xray uuid)
 KEYS=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYS" | awk '/Private/{print $3}')
-PUBLIC_KEY=$(echo "$KEYS" | awk '/Public/{print $3}')
+PRIVATE_KEY=$(echo "$KEYS" | grep -i 'private' | sed -E 's/^[^:]*:[[:space:]]*//')
+PUBLIC_KEY=$(echo "$KEYS"  | grep -Ei 'public|password' | sed -E 's/^[^:]*:[[:space:]]*//')
+[[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || { echo "$KEYS"; die "failed to parse xray x25519 output"; }
 SHORT_ID=$(openssl rand -hex 8)
 
 mkdir -p /usr/local/etc/xray
@@ -112,7 +120,14 @@ step "冲刺，开启服务 / Starting Service"
 systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
 sleep 1
-systemctl is-active --quiet xray || die "xray failed to start"
+systemctl is-active --quiet xray || {
+  echo -e "${C_R}[FAIL]${C_N}"
+  echo "---- journalctl -u xray -n 30 ----"
+  journalctl -u xray -n 30 --no-pager || true
+  echo "---- xray config test ----"
+  /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json || true
+  die "xray failed to start"
+}
 ok
 
 # ---------- 6. BBR ----------
