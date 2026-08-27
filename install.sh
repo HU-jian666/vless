@@ -1,8 +1,8 @@
 #!/bin/bash
 # 极简 Xray VLESS + Reality 一键脚本（完全自动化）
-# 支持 Ubuntu/Debian/CentOS/Rocky/Alma/Fedora 等
+# 专为 NAT VPS 优化：默认随机高端口
 # 用法：bash install.sh
-# 可选：--port=443 --sni=www.microsoft.com --uuid=你的UUID
+# 可选：--port=指定端口 --sni=www.microsoft.com --uuid=你的UUID
 
 SECONDS=0
 
@@ -25,6 +25,7 @@ while [[ $# -gt 0 ]]; do
         --uuid=*) UUID="${1#*=}"; shift ;;
         --help|-h)
             echo "用法: $0 [--port=端口] [--sni=域名] [--uuid=UUID]"
+            echo "默认使用随机高端口（适合 NAT VPS）"
             exit 0
             ;;
         *) shift ;;
@@ -38,11 +39,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo -e "${cyan}本脚本支持带参数执行，不带参数将直接无脑 / See --help for parameters${none}"
+echo -e "${cyan}NAT VPS 模式：默认随机高端口${none}"
 
 # ---------- 1. 工具链检查 ----------
 task "工具链检查 / Tool check"
 
-# 检测包管理器
 PKG=""
 if command -v apt-get >/dev/null 2>&1; then
     PKG="apt"
@@ -65,14 +66,12 @@ install_pkg() {
     esac
 }
 
-# 必要工具
 for cmd in curl openssl; do
     if ! command -v $cmd >/dev/null 2>&1; then
         install_pkg $cmd || { fail; echo -e "${red}无法安装 $cmd，请手动安装后重试${none}"; exit 1; }
     fi
 done
 
-# 可选但推荐
 command -v jq >/dev/null 2>&1 || install_pkg jq || true
 command -v ss  >/dev/null 2>&1 || install_pkg iproute2 || install_pkg iproute || true
 
@@ -85,7 +84,7 @@ if ! command -v xray >/dev/null 2>&1; then
     if ! command -v xray >/dev/null 2>&1; then
         fail
         echo -e "${red}Xray 安装失败，请查看 /tmp/xray-install.log${none}"
-        cat /tmp/xray-install.log | tail -20
+        tail -30 /tmp/xray-install.log
         exit 1
     fi
 fi
@@ -105,7 +104,6 @@ KEYS=$(xray x25519 2>/dev/null)
 PRIVATE_KEY=$(echo "$KEYS" | grep -i Private | awk '{print $NF}')
 PUBLIC_KEY=$(echo "$KEYS"  | grep -i Public  | awk '{print $NF}')
 
-# 兼容不同版本输出格式
 if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
     PRIVATE_KEY=$(echo "$KEYS" | sed -n 's/.*Private key: *//p' | head -1)
     PUBLIC_KEY=$(echo "$KEYS"  | sed -n 's/.*Public key: *//p'  | head -1)
@@ -113,19 +111,24 @@ fi
 
 SHORT_ID=$(openssl rand -hex 8)
 
-# 自动选空闲端口
+# ========== NAT VPS 随机高端口逻辑 ==========
 if [[ $PORT -eq 0 ]]; then
-    for p in 443 8443 2053 2083 2087 2096 $(shuf -i 10000-60000 -n 15 2>/dev/null || echo 10000 20000 30000); do
+    # 优先随机高端口（10000-60000），适合 NAT VPS
+    for i in {1..30}; do
+        p=$((10000 + RANDOM % 50000))
+        # 检查端口是否被占用
         if command -v ss >/dev/null 2>&1; then
             ss -tuln 2>/dev/null | grep -q ":$p " && continue
-        else
+        elif command -v netstat >/dev/null 2>&1; then
             netstat -tuln 2>/dev/null | grep -q ":$p " && continue
         fi
         PORT=$p
         break
     done
-    [[ $PORT -eq 0 ]] && PORT=443
+    # 兜底
+    [[ $PORT -eq 0 ]] && PORT=$((20000 + RANDOM % 30000))
 fi
+# ==========================================
 
 # 公网 IP
 IP=$(curl -4s --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
@@ -198,7 +201,6 @@ if command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service >
         exit 1
     fi
 else
-    # 无 systemd 环境（容器等）直接后台运行
     pkill -f "xray run" >/dev/null 2>&1 || true
     nohup /usr/local/bin/xray run -config /usr/local/etc/xray/config.json > /var/log/xray/nohup.log 2>&1 &
     sleep 1
@@ -241,5 +243,6 @@ echo
 LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#$(hostname)"
 echo -e "${magenta}${LINK}${none}"
 echo
+info "使用端口 / Port: ${green}${PORT}${none} （随机高端口，适合 NAT VPS）"
 info "总用时 / Elapsed Time:  ${green}${SECONDS} 秒${none}"
 echo -e "---------- ${cyan}live free or die hard${none} -------------"
