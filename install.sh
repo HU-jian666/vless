@@ -1,149 +1,142 @@
 #!/usr/bin/env bash
-#
-# https://github.com/yourname/hysteria2-nokey
-# 全自动安装 Hysteria2 (HY2)
-# 无需域名（自签证书）、无需交互、不创建 swap，适配 NAT VPS 随机端口 + 小内存/小硬盘
-# Fully automatic Hysteria2 (HY2) installer
-# No domain (self-signed cert), no prompts, no swap file — for NAT VPS random port + low RAM/disk
-#
-# 用法 / Usage:
-#   bash install.sh          直接运行，全自动完成安装 / just run it, fully automatic
-#
+# https://github.com/YOURNAME/xray-vless-reality-nokey
+# VLESS + XTLS-REALITY one-click installer (no cert / no domain needed)
+# 本脚本支持带参数执行，不带参数将直接使用推荐默认值 / See --help for parameters
 set -euo pipefail
 
-# ---------- 颜色 / Colors ----------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-ok()  { echo -e "${GREEN}[OK]${NC}"; }
-err() { echo -e "${RED}$1${NC}"; exit 1; }
+# ---------- colors ----------
+C_G='\033[1;32m'; C_C='\033[1;36m'; C_Y='\033[1;33m'; C_R='\033[1;31m'; C_N='\033[0m'
+ok()   { echo -e "${C_G}[OK]${C_N}"; }
+step() { echo -ne "${C_C}$1${C_N} ... "; }
+die()  { echo -e "${C_R}[FAIL]${C_N} $1"; exit 1; }
 
 START_TS=$(date +%s)
 
-# ---------- 参数（全部自动生成，无需输入） / All auto-generated, no input needed ----------
-PORT=$(shuf -i 20000-60000 -n 1)      # NAT VPS 随机高位端口 / random high port for NAT VPS
-SNI="www.bing.com"                    # 仅用于证书 CN、客户端 SNI 与伪装站点 / cert CN, client SNI & masquerade site
-MASQ_URL="https://www.bing.com"
-PASSWORD=""
-CONFIG_DIR="/usr/local/etc/hysteria"
-CERT_DIR="${CONFIG_DIR}/cert"
-BIN_PATH="/usr/local/bin/hysteria"
-SERVICE_NAME="hysteria-server"
+# ---------- defaults ----------
+rand_port() {
+  local p
+  while :; do
+    p=$(( (RANDOM << 4 | RANDOM) % 55536 + 10000 ))   # 10000-65535
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$" || { echo "$p"; return; }
+  done
+}
+PORT=$(rand_port)
+SNI="www.microsoft.com"
+UUID=""
+TAG="vless-reality"
 
-[[ $EUID -ne 0 ]] && err "请使用 root 运行此脚本 / Please run this script as root"
+usage() {
+  cat <<EOF
+Usage: $0 [--port 443] [--sni www.microsoft.com] [--uuid <uuid>] [--tag name]
+  --port    监听端口 / listen port      (default: random 10000-65535)
+  --sni     伪装域名 / camouflage SNI    (default: $SNI)
+  --uuid    自定义 UUID / custom UUID    (default: auto-generated)
+  --tag     节点备注 / node remark       (default: $TAG)
+  -h --help 显示帮助 / show this help
+EOF
+  exit 0
+}
 
-# ---------- 1. 工具链检查 / Tool check ----------
-echo "工具链检查 / Tool check ..."
-for cmd in curl systemctl openssl shuf; do
-  command -v "$cmd" >/dev/null 2>&1 || err "缺少依赖: $cmd / Missing dependency: $cmd"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --sni) SNI="$2"; shift 2 ;;
+    --uuid) UUID="$2"; shift 2 ;;
+    --tag) TAG="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) die "unknown arg: $1" ;;
+  esac
 done
+
+[[ $EUID -eq 0 ]] || die "请以 root 运行 / must run as root"
+
+# ---------- 1. tool check ----------
+step "工具链检查 / Tool check"
+for bin in curl jq openssl systemctl; do
+  command -v "$bin" >/dev/null 2>&1 || (command -v apt-get >/dev/null && apt-get install -y "$bin" -qq >/dev/null 2>&1) || true
+done
+command -v curl >/dev/null && command -v openssl >/dev/null || die "missing dependencies"
 ok
 
-# ---------- 2. 安装 Hysteria2 / Install Hysteria2 ----------
-echo "开始，安装 Hysteria2 / Install Hysteria2 ..."
-case "$(uname -m)" in
-  x86_64|amd64) ARCH="amd64" ;;
-  aarch64|arm64) ARCH="arm64" ;;
-  armv7l) ARCH="arm" ;;
-  *) err "不支持的架构: $(uname -m) / Unsupported architecture" ;;
-esac
-
-curl -fsSL "https://download.hysteria.network/app/latest/hysteria-linux-${ARCH}" -o "$BIN_PATH" \
-  || err "Hysteria2 下载失败 / Hysteria2 download failed"
-chmod +x "$BIN_PATH"
+# ---------- 2. install xray ----------
+step "开始，安装 XRAY / Install XRAY"
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1 \
+  || die "xray install failed"
 ok
 
-# ---------- 3. 生成参数 / Generate parameters ----------
-echo "生成密钥与参数 / Generating keys & parameters ..."
-PASSWORD=$(openssl rand -hex 16)
-
-mkdir -p "$CERT_DIR"
-openssl ecparam -genkey -name prime256v1 -out "${CERT_DIR}/private.key" >/dev/null 2>&1
-openssl req -new -x509 -days 3650 -key "${CERT_DIR}/private.key" \
-  -out "${CERT_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
+# ---------- 3. update geodata ----------
+step "加速，更新 geodata / Updating geodata"
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 || true
 ok
 
-# ---------- 4. 配置 config.yaml / Configuring config.yaml ----------
-echo "快到了，手搓 / Configuring ${CONFIG_DIR}/config.yaml ..."
-mkdir -p "$CONFIG_DIR"
-cat > "${CONFIG_DIR}/config.yaml" <<EOF
-listen: :${PORT}
+# ---------- 4. generate keys/uuid ----------
+step "快好了，手搓 / Configuring /usr/local/etc/xray/config.json"
+[[ -z "$UUID" ]] && UUID=$(xray uuid)
+KEYS=$(xray x25519)
+PRIVATE_KEY=$(echo "$KEYS" | awk '/Private/{print $3}')
+PUBLIC_KEY=$(echo "$KEYS" | awk '/Public/{print $3}')
+SHORT_ID=$(openssl rand -hex 8)
 
-tls:
-  cert: ${CERT_DIR}/cert.pem
-  key: ${CERT_DIR}/private.key
-
-auth:
-  type: password
-  password: ${PASSWORD}
-
-masquerade:
-  type: proxy
-  proxy:
-    url: ${MASQ_URL}
-    rewriteHost: true
-
-bandwidth:
-  up: 200 mbps
-  down: 200 mbps
+mkdir -p /usr/local/etc/xray
+cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "0.0.0.0",
+    "port": ${PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${UUID}", "flow": "xtls-rprx-vision" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "${SNI}:443",
+        "xver": 0,
+        "serverNames": ["${SNI}"],
+        "privateKey": "${PRIVATE_KEY}",
+        "shortIds": ["${SHORT_ID}"]
+      }
+    }
+  }],
+  "outbounds": [{ "protocol": "freedom" }]
+}
 EOF
 ok
 
-# ---------- 5. 启动服务 / Starting service ----------
-echo "冲刺，开启服务 / Starting Service ..."
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Hysteria2 Server Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${BIN_PATH} server -c ${CONFIG_DIR}/config.yaml
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=infinity
-MemoryMax=48M
-MemoryHigh=40M
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-systemctl restart "$SERVICE_NAME"
+# ---------- 5. start service ----------
+step "冲刺，开启服务 / Starting Service"
+systemctl enable xray >/dev/null 2>&1
+systemctl restart xray
 sleep 1
+systemctl is-active --quiet xray || die "xray failed to start"
 ok
 
-# ---------- 6. 开启 BBR / Enabling BBR ----------
-echo "最后，打开 BBR / Finishing, Enabling BBR ..."
+# ---------- 6. BBR ----------
+step "最后，打开 BBR / Finishing, Enabling BBR"
 if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-  {
-    echo "net.core.default_qdisc=fq"
-    echo "net.ipv4.tcp_congestion_control=bbr"
-  } >> /etc/sysctl.conf
+  echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+  echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
   sysctl -p >/dev/null 2>&1 || true
 fi
 ok
 
-# ---------- 7. 检查服务状态 / Checking service status ----------
-echo "检查服务状态 / Checking Service ..."
-systemctl is-active --quiet "$SERVICE_NAME" && ok || err "服务未运行 / Service is not running"
+# ---------- 7. check service ----------
+step "检查服务状态 / Checking Service"
+systemctl is-active --quiet xray && ok || die "service not running"
 
-# ---------- 完成 / Done ----------
-PUBLIC_IP=$(curl -fsSL4 https://api.ipify.org || curl -fsSL https://ifconfig.me) \
-  || err "无法探测公网 IP / Could not detect public IP"
+echo -e "${C_G}舒服了 / Done:${C_N}"
+echo
 
-LINK="hysteria2://${PASSWORD}@${PUBLIC_IP}:${PORT}/?insecure=1&sni=${SNI}#HY2-${PUBLIC_IP}"
+IP=$(curl -s4 --max-time 5 https://api.ipify.org || curl -s6 --max-time 5 https://api64.ipify.org)
+LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
 
-echo ""
-echo "舒服了 / Done:"
-echo ""
-echo "$LINK"
-echo ""
-echo -e "${YELLOW}证书为自签，客户端必须开启 \"跳过证书验证 / insecure\" 才能连接${NC}"
-echo -e "${YELLOW}Certificate is self-signed — client must enable \"skip cert verify / insecure\" to connect${NC}"
-echo -e "${YELLOW}HY2 基于 QUIC，走 UDP。若为 NAT VPS，请到服务商后台把端口 ${PORT}（UDP）做转发，并把链接里的端口换成对外映射端口${NC}"
-echo -e "${YELLOW}HY2 runs over QUIC/UDP. If this is a NAT VPS, forward port ${PORT} (UDP) at your provider's panel and replace the port in the link with the mapped public port${NC}"
-echo ""
+echo -e "${C_Y}${LINK}${C_N}"
+echo
 
 END_TS=$(date +%s)
-echo "总用时 / Elapsed Time: $((END_TS - START_TS)) 秒"
+echo "总用时 / Elapsed Time:  $((END_TS-START_TS)) 秒"
 echo "---------- live free or die hard --------------"
