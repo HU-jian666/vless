@@ -27,7 +27,8 @@ rand_port() {
     echo "$p"; return
   done
 }
-PORT=$(rand_port)
+CONF=/usr/local/etc/xray/config.json
+PORT=""
 SNI="www.microsoft.com"
 UUID=""
 TAG="vless-reality"
@@ -65,6 +66,21 @@ done
 [[ $EUID -eq 0 ]] || die "请以 root 运行 / must run as root"
 
 SNI=$(strip_md_link "$SNI")
+
+# 端口/UUID 若未显式指定，优先复用上次生成的 config.json 里的值——
+# 避免重跑脚本随机换端口，导致跟面板/NAT 里已经配好的端口转发对不上（表现就是“连不上”）。
+if [[ -f "$CONF" ]]; then
+  OLD_PORT=$(grep -oE '"port":[[:space:]]*[0-9]+' "$CONF" | head -1 | grep -oE '[0-9]+' || true)
+  OLD_UUID=$(grep -oE '"id":[[:space:]]*"[0-9a-fA-F-]+"' "$CONF" | head -1 | grep -oE '[0-9a-fA-F-]{36}' || true)
+  if [[ -z "$PORT" && -n "$OLD_PORT" ]]; then
+    PORT="$OLD_PORT"
+    echo -e "${C_Y}[INFO]${C_N} 复用已有端口 ${PORT}（避免打乱已配置的端口转发）。要换端口显式传 --port"
+  fi
+  if [[ -z "$UUID" && -n "$OLD_UUID" ]]; then
+    UUID="$OLD_UUID"
+  fi
+fi
+[[ -z "$PORT" ]] && PORT=$(rand_port)
 
 # ---------- 1. tool check ----------
 step "工具链检查 / Tool check"
@@ -147,18 +163,77 @@ ok
 
 # ---------- 6. BBR ----------
 step "最后，打开 BBR / Finishing, Enabling BBR"
-if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-  echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-  echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-  sysctl -p >/dev/null 2>&1 || true
+CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+if [[ "$CURRENT_CC" == "bbr" ]]; then
+  ok
+else
+  AVAILABLE_CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+  if [[ "$AVAILABLE_CC" != *bbr* ]]; then
+    modprobe tcp_bbr 2>/dev/null || true
+    AVAILABLE_CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+  fi
+  if [[ "$AVAILABLE_CC" != *bbr* ]]; then
+    echo -e "${C_Y}[WARN]${C_N} 内核不支持 BBR 模块（tcp_bbr 不可用），跳过——这不影响连通性，只影响吞吐"
+  else
+    grep -q '^net.core.default_qdisc=fq' /etc/sysctl.conf 2>/dev/null || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    grep -q '^net.ipv4.tcp_congestion_control=bbr' /etc/sysctl.conf 2>/dev/null || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    SYSCTL_ERR=$(sysctl -p 2>&1 >/dev/null || true)
+    NEW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    if [[ "$NEW_CC" == "bbr" ]]; then
+      ok
+    else
+      echo -e "${C_Y}[WARN]${C_N} sysctl 写入未生效（多半是容器化 NAT VPS，/proc 只读或无 CAP_NET_ADMIN），BBR 开不了：${SYSCTL_ERR:-写入被拒绝}"
+      echo -e "${C_Y}      不影响连通性，只是没有 BBR 加速${C_N}"
+    fi
+  fi
 fi
-ok
 
 # ---------- 7. check service ----------
 step "检查服务状态 / Checking Service"
 systemctl is-active --quiet xray && ok || die "service not running"
 
+# ---------- 7b. verify the REALITY fallback target actually supports what REALITY needs ----------
+# 光 TCP 三次握手通是不够的：REALITY 要求目标必须能完整走 TLS1.3 握手。
+# www.microsoft.com 走 Azure Front Door，边缘节点行为不稳定，是已知对 REALITY
+# 不太友好的目标（容易被按 ClientHello 指纹拒绝），所以这里做真实 TLS1.3 探测，
+# 不行就自动换一个更稳的目标并重写 config.json。
+step "校验回落目标 TLS1.3 可达性 / Verifying dest TLS1.3 handshake"
+check_tls13() {
+  echo | timeout 6 openssl s_client -connect "$1:443" -servername "$1" -tls1_3 2>/dev/null \
+    | grep -q "Protocol.*TLSv1.3"
+}
+if check_tls13 "$SNI"; then
+  ok
+else
+  echo -e "${C_Y}[WARN]${C_N} ${SNI}:443 TLS1.3 握手失败，REALITY 会连不上。尝试自动切换伪装域名..."
+  FALLBACKS=(www.bing.com www.amazon.com gateway.icloud.com swdist.apple.com www.cloudflare.com)
+  NEW_SNI=""
+  for cand in "${FALLBACKS[@]}"; do
+    [[ "$cand" == "$SNI" ]] && continue
+    step "  尝试 ${cand}"
+    if check_tls13 "$cand"; then
+      ok
+      NEW_SNI="$cand"
+      break
+    else
+      echo -e "${C_R}[FAIL]${C_N}"
+    fi
+  done
+  if [[ -n "$NEW_SNI" ]]; then
+    echo -e "${C_Y}[INFO]${C_N} 切换伪装域名: ${SNI} -> ${NEW_SNI}，重写 config.json"
+    SNI="$NEW_SNI"
+    sed -i "s#\"dest\": \".*\"#\"dest\": \"${SNI}:443\"#" "$CONF"
+    sed -i "s#\"serverNames\": \[.*\]#\"serverNames\": [\"${SNI}\"]#" "$CONF"
+    systemctl restart xray
+    sleep 1
+    systemctl is-active --quiet xray || die "xray restart failed after SNI switch"
+  else
+    echo -e "${C_R}[WARN]${C_N} 候选伪装域名全部 TLS1.3 探测失败，服务器出站可能被限制。保留 ${SNI}，但大概率仍连不上，建议人工换一个你确认可达的域名用 --sni 指定"
+  fi
+fi
+
 echo -e "${C_G}舒服了 / Done:${C_N}"
+echo -e "监听端口 / Listening port: ${C_Y}${PORT}${C_N}  ${C_R}（NAT/面板端口转发必须转发这个端口，TCP+UDP 都要放）${C_N}"
 echo
 
 IP=$(curl -s4 --max-time 5 https://api.ipify.org || curl -s6 --max-time 5 https://api64.ipify.org)
