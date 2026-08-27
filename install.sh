@@ -245,3 +245,25 @@ echo
 END_TS=$(date +%s)
 echo "总用时 / Elapsed Time:  $((END_TS-START_TS)) 秒"
 echo "---------- live free or die hard --------------"
+echo
+
+# ---------- 8. one-shot diagnostic bundle ----------
+# 之前几轮排查全靠人工分别跑好几条命令、再手动贴结果，容易漏、容易被终端/粘贴通道搞乱。
+# 这里一次性收集所有排查需要的信息，跑完直接把这整段复制发出去就行。
+echo "===================== DIAG START ====================="
+echo "-- date --"; date
+echo "-- config.json (privateKey 截断) --"
+sed -E 's/("privateKey": ")[^"]{6}[^"]*(")/\1******\2/' "$CONF"
+echo "-- systemctl status --"
+systemctl is-active xray; systemctl is-enabled xray 2>/dev/null || true
+echo "-- listening ports (tcp) --"
+(command -v ss >/dev/null && ss -tlnp | grep -E ":${PORT}\b") || echo "ss not available"
+echo "-- xray journal (last 20) --"
+journalctl -u xray -n 20 --no-pager
+echo "-- dest TLS1.3 result --"
+if check_tls13 "$SNI"; then echo "TLS1.3 OK: $SNI"; else echo "TLS1.3 FAILED: $SNI"; fi
+echo "-- outbound IP as seen by internet --"
+echo "$IP"
+echo "-- generated link --"
+echo "$LINK"
+echo "===================== DIAG END ====================="
